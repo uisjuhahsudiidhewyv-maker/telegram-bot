@@ -23,6 +23,115 @@ SEARCH_CACHE = {}
 RESULTS_PER_PAGE = 10
 CHAPTERS_PER_PAGE = 15
 
+# ==========================================================
+# LIMPEZA DE RASTROS
+# ==========================================================
+# O bot apaga mensagens de comando e mensagens de controle
+# que ele próprio enviou. Os arquivos CBZ enviados continuam
+# no grupo, pois são o conteúdo desejado.
+DELETE_BOT_TRACES = os.getenv("DELETE_BOT_TRACES", "true").lower() in (
+    "1", "true", "yes", "on"
+)
+TRACE_DELETE_DELAY = int(os.getenv("TRACE_DELETE_DELAY", "300"))
+
+# {(chat_id, thread_id, user_id): {message_id, ...}}
+CONTROL_MESSAGES = {}
+
+
+def _session_key(message, user_id):
+    chat_id = message.chat_id
+    thread_id = getattr(message, "message_thread_id", None) or 0
+    return (chat_id, thread_id, user_id)
+
+
+def _remember_control(message, user_id, bot):
+    if not DELETE_BOT_TRACES:
+        return
+
+    key = _session_key(message, user_id)
+    CONTROL_MESSAGES.setdefault(key, set()).add(message.message_id)
+
+    # Evita deixar um menu abandonado para sempre.
+    asyncio.create_task(
+        _expire_control_message(key, message.message_id, bot)
+    )
+
+
+async def _expire_control_message(key, message_id, bot):
+    await asyncio.sleep(max(0, TRACE_DELETE_DELAY))
+
+    ids = CONTROL_MESSAGES.get(key)
+    if not ids or message_id not in ids:
+        return
+
+    chat_id, _, _ = key
+
+    try:
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id
+        )
+    except Exception:
+        pass
+
+    ids.discard(message_id)
+    if not ids:
+        CONTROL_MESSAGES.pop(key, None)
+
+
+async def track_and_send(bot, chat_id, user_id, text, **kwargs):
+    """Envia uma mensagem de controle e registra-a para limpeza."""
+    message = await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    _remember_control(message, user_id, bot)
+    return message
+
+
+async def forget_control(message, user_id):
+    if not DELETE_BOT_TRACES or not message:
+        return
+
+    key = _session_key(message, user_id)
+    ids = CONTROL_MESSAGES.get(key)
+    if ids:
+        ids.discard(message.message_id)
+        if not ids:
+            CONTROL_MESSAGES.pop(key, None)
+
+    try:
+        await message.delete()
+    except Exception:
+        # O bot pode não ter permissão para apagar mensagens.
+        pass
+
+
+async def cleanup_session(bot, message, user_id):
+    """Apaga todos os controles registrados para este usuário/tópico."""
+    if not DELETE_BOT_TRACES or not message:
+        return
+
+    key = _session_key(message, user_id)
+    ids = list(CONTROL_MESSAGES.pop(key, set()))
+
+    for message_id in ids:
+        try:
+            await bot.delete_message(
+                chat_id=message.chat_id,
+                message_id=message_id
+            )
+        except Exception:
+            pass
+
+
+async def delete_user_command(update):
+    """Apaga o comando do administrador (/bb ...), se possível."""
+    if not DELETE_BOT_TRACES or not update.message:
+        return
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
 
 # ==========================================================
 # DONO DO BOTÃO
@@ -31,7 +140,7 @@ CHAPTERS_PER_PAGE = 15
 def is_owner(query):
     try:
         return query.from_user.id == int(query.data.split("|")[-1])
-    except:
+    except Exception:
         return False
 
 
@@ -46,25 +155,45 @@ async def worker():
             await send_chapter(job)
         except Exception as e:
             print("Erro worker:", e)
-        DOWNLOAD_QUEUE.task_done()
+        finally:
+            DOWNLOAD_QUEUE.task_done()
 
 
 async def send_chapter(job):
-
     async with DOWNLOAD_SEMAPHORE:
-
         message = job["message"]
+        bot = job["bot"]
         source = job["source"]
         chapter = job["chapter"]
+        chat_id = job["chat_id"]
+        thread_id = job.get("thread_id")
 
         try:
             pages = await source.pages(chapter["url"])
-        except:
-            await message.reply_text("❌ Erro ao obter páginas.")
+        except Exception:
+            try:
+                status = await bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Erro ao obter páginas.",
+                    message_thread_id=thread_id
+                )
+                await asyncio.sleep(2)
+                await forget_control(status, job["user_id"])
+            except Exception:
+                pass
             return
 
         if not pages:
-            await message.reply_text("❌ Nenhuma página encontrada.")
+            try:
+                status = await bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Nenhuma página encontrada.",
+                    message_thread_id=thread_id
+                )
+                await asyncio.sleep(2)
+                await forget_control(status, job["user_id"])
+            except Exception:
+                pass
             return
 
         try:
@@ -73,32 +202,59 @@ async def send_chapter(job):
                 chapter.get("manga_title", "Manga"),
                 f"Cap_{chapter.get('chapter_number')}",
             )
-        except:
-            await message.reply_text("❌ Erro ao criar CBZ.")
+        except Exception:
+            try:
+                status = await bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Erro ao criar CBZ.",
+                    message_thread_id=thread_id
+                )
+                await asyncio.sleep(2)
+                await forget_control(status, job["user_id"])
+            except Exception:
+                pass
             return
 
-        await message.reply_document(document=cbz_buffer, filename=cbz_name)
-        cbz_buffer.close()
+        try:
+            # O CBZ NÃO é apagado: ele é o conteúdo que o bot deve entregar.
+            await bot.send_document(
+                chat_id=chat_id,
+                document=cbz_buffer,
+                filename=cbz_name,
+                message_thread_id=thread_id
+            )
+        finally:
+            cbz_buffer.close()
 
 
 # ==========================================================
-# BUSCAR EM TODAS AS FONTES (AGUARDANDO TODAS)
+# BUSCAR EM TODAS AS FONTES
 # ==========================================================
 
 async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Apaga imediatamente o comando /bb nome.
+    await delete_user_command(update)
 
     query_text = " ".join(context.args)
     if not query_text:
-        await update.message.reply_text("Use /bb <nome>")
+        # Sem a mensagem original, não há necessidade de deixar aviso.
         return
 
-    msg = await update.message.reply_text("🔎 Buscando em todas as fontes...")
+    user_id = update.effective_user.id
+    bot = context.bot
+
+    msg = await track_and_send(
+        bot,
+        update.effective_chat.id,
+        user_id,
+        "🔎 Buscando em todas as fontes..."
+    )
 
     sources = get_all_sources()
-    tasks = []
-
-    for source_name, source in sources.items():
-        tasks.append(search_source(source_name, source, query_text))
+    tasks = [
+        search_source(source_name, source, query_text)
+        for source_name, source in sources.items()
+    ]
 
     results = await asyncio.gather(*tasks)
 
@@ -108,11 +264,11 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not combined:
         await msg.edit_text("❌ Nenhum resultado encontrado.")
+        # Some sozinho depois do prazo configurado, se continuar abandonado.
         return
 
     SEARCH_CACHE[msg.message_id] = combined
-
-    await show_results(msg, update.effective_user.id, 0)
+    await show_results(msg, user_id, 0)
 
 
 async def search_source(name, source, query):
@@ -122,7 +278,7 @@ async def search_source(name, source, query):
             {"source": name, "title": m["title"], "url": m["url"]}
             for m in res
         ]
-    except:
+    except Exception:
         return []
 
 
@@ -131,10 +287,11 @@ async def search_source(name, source, query):
 # ==========================================================
 
 async def show_results(message, user_id, page):
+    data = SEARCH_CACHE.get(message.message_id, [])
+    if not data:
+        return
 
-    data = SEARCH_CACHE[message.message_id]
     total_pages = math.ceil(len(data) / RESULTS_PER_PAGE)
-
     start = page * RESULTS_PER_PAGE
     end = start + RESULTS_PER_PAGE
 
@@ -149,12 +306,21 @@ async def show_results(message, user_id, page):
         ])
 
     nav = []
-
     if page > 0:
-        nav.append(InlineKeyboardButton("«", callback_data=f"page|{page-1}|{user_id}"))
+        nav.append(
+            InlineKeyboardButton(
+                "«",
+                callback_data=f"page|{page-1}|{user_id}"
+            )
+        )
 
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("»", callback_data=f"page|{page+1}|{user_id}"))
+        nav.append(
+            InlineKeyboardButton(
+                "»",
+                callback_data=f"page|{page+1}|{user_id}"
+            )
+        )
 
     if nav:
         buttons.append(nav)
@@ -170,9 +336,8 @@ async def show_results(message, user_id, page):
 # ==========================================================
 
 async def show_chapters(message, context, page, user_id):
-
     chapters = context.user_data["chapters"]
-    total_pages = math.ceil(len(chapters) / CHAPTERS_PER_PAGE)
+    total_pages = max(1, math.ceil(len(chapters) / CHAPTERS_PER_PAGE))
 
     start = page * CHAPTERS_PER_PAGE
     end = start + CHAPTERS_PER_PAGE
@@ -190,15 +355,29 @@ async def show_chapters(message, context, page, user_id):
     nav = []
 
     if page > 0:
-        nav.append(InlineKeyboardButton("«", callback_data=f"chap_page|{page-1}|{user_id}"))
+        nav.append(
+            InlineKeyboardButton(
+                "«",
+                callback_data=f"chap_page|{page-1}|{user_id}"
+            )
+        )
 
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("»", callback_data=f"chap_page|{page+1}|{user_id}"))
+        nav.append(
+            InlineKeyboardButton(
+                "»",
+                callback_data=f"chap_page|{page+1}|{user_id}"
+            )
+        )
 
-    buttons.append(nav)
+    if nav:
+        buttons.append(nav)
 
     buttons.append([
-        InlineKeyboardButton("🔙 Voltar", callback_data=f"back|0|{user_id}")
+        InlineKeyboardButton(
+            "🔙 Voltar",
+            callback_data=f"back|0|{user_id}"
+        )
     ])
 
     await message.edit_text(
@@ -214,6 +393,7 @@ async def show_chapters(message, context, page, user_id):
 async def change_page(update, context):
     query = update.callback_query
     await query.answer()
+
     if not is_owner(query):
         return
 
@@ -224,14 +404,21 @@ async def change_page(update, context):
 async def select_manga(update, context):
     query = update.callback_query
     await query.answer()
+
     if not is_owner(query):
         return
 
     index = int(query.data.split("|")[1])
-    data = SEARCH_CACHE[query.message.message_id][index]
+    data = SEARCH_CACHE.get(query.message.message_id, [])[index]
 
+    # O mesmo card/menu é reutilizado, evitando criar outra mensagem.
     source = get_all_sources()[data["source"]]
-    chapters = await source.chapters(data["url"])
+
+    try:
+        chapters = await source.chapters(data["url"])
+    except Exception:
+        await cleanup_session(context.bot, query.message, query.from_user.id)
+        return
 
     context.user_data["chapters"] = chapters
     context.user_data["source"] = source
@@ -240,11 +427,21 @@ async def select_manga(update, context):
     user_id = query.from_user.id
 
     buttons = [
-        [InlineKeyboardButton("📥 Baixar tudo", callback_data=f"download_all|0|{user_id}")],
-        [InlineKeyboardButton("📖 Ver capítulos", callback_data=f"chap_page|0|{user_id}")]
+        [
+            InlineKeyboardButton(
+                "📥 Baixar tudo",
+                callback_data=f"download_all|0|{user_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📖 Ver capítulos",
+                callback_data=f"chap_page|0|{user_id}"
+            )
+        ]
     ]
 
-    await query.message.reply_text(
+    await query.message.edit_text(
         f"📖 {data['title']}\nTotal: {len(chapters)} capítulos",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -253,45 +450,68 @@ async def select_manga(update, context):
 async def download_all(update, context):
     query = update.callback_query
     await query.answer()
+
     if not is_owner(query):
         return
 
-    chapters = context.user_data["chapters"]
-    source = context.user_data["source"]
+    chapters = context.user_data.get("chapters", [])
+    source = context.user_data.get("source")
+
+    if not chapters or not source:
+        await cleanup_session(context.bot, query.message, query.from_user.id)
+        return
 
     for chap in chapters:
         await DOWNLOAD_QUEUE.put({
             "message": query.message,
+            "bot": context.bot,
+            "chat_id": query.message.chat_id,
+            "thread_id": getattr(query.message, "message_thread_id", None),
             "source": source,
-            "chapter": chap
+            "chapter": chap,
+            "user_id": query.from_user.id
         })
 
-    await query.message.reply_text("📥 Todos capítulos adicionados na fila.")
+    # Apaga o menu e a sessão de controle.
+    await cleanup_session(context.bot, query.message, query.from_user.id)
 
 
 async def download_one(update, context):
     query = update.callback_query
     await query.answer()
+
     if not is_owner(query):
         return
 
     index = int(query.data.split("|")[1])
 
-    chap = context.user_data["chapters"][index]
-    source = context.user_data["source"]
+    chapters = context.user_data.get("chapters", [])
+    source = context.user_data.get("source")
+
+    if index >= len(chapters) or not source:
+        await cleanup_session(context.bot, query.message, query.from_user.id)
+        return
+
+    chap = chapters[index]
 
     await DOWNLOAD_QUEUE.put({
         "message": query.message,
+        "bot": context.bot,
+        "chat_id": query.message.chat_id,
+        "thread_id": getattr(query.message, "message_thread_id", None),
         "source": source,
-        "chapter": chap
+        "chapter": chap,
+        "user_id": query.from_user.id
     })
 
-    await query.message.reply_text("📥 Capítulo adicionado na fila.")
+    # O menu desaparece assim que o pedido é feito.
+    await cleanup_session(context.bot, query.message, query.from_user.id)
 
 
 async def change_chap_page(update, context):
     query = update.callback_query
     await query.answer()
+
     if not is_owner(query):
         return
 
@@ -302,6 +522,7 @@ async def change_chap_page(update, context):
 async def back_to_results(update, context):
     query = update.callback_query
     await query.answer()
+
     if not is_owner(query):
         return
 
@@ -316,19 +537,21 @@ def main():
     app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
 
     app.add_handler(CommandHandler("bb", buscar))
-    app.add_handler(CallbackQueryHandler(change_page, pattern="^page"))
-    app.add_handler(CallbackQueryHandler(select_manga, pattern="^select"))
-    app.add_handler(CallbackQueryHandler(download_all, pattern="^download_all"))
-    app.add_handler(CallbackQueryHandler(download_one, pattern="^download_one"))
-    app.add_handler(CallbackQueryHandler(change_chap_page, pattern="^chap_page"))
-    app.add_handler(CallbackQueryHandler(back_to_results, pattern="^back"))
+    app.add_handler(CallbackQueryHandler(change_page, pattern=r"^page"))
+    app.add_handler(CallbackQueryHandler(select_manga, pattern=r"^select"))
+    app.add_handler(CallbackQueryHandler(download_all, pattern=r"^download_all"))
+    app.add_handler(CallbackQueryHandler(download_one, pattern=r"^download_one"))
+    app.add_handler(CallbackQueryHandler(change_chap_page, pattern=r"^chap_page"))
+    app.add_handler(CallbackQueryHandler(back_to_results, pattern=r"^back"))
 
-    async def startup(app):
+    async def startup(application):
         asyncio.create_task(worker())
 
     app.post_init = startup
 
     print("🤖 Bot iniciado")
+    print(f"🧹 Limpeza de rastros: {'ATIVADA' if DELETE_BOT_TRACES else 'DESATIVADA'}")
+
     app.run_polling(drop_pending_updates=True)
 
 
