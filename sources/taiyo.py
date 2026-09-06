@@ -1,171 +1,79 @@
-import httpx
-import re
-import json
+import json,re,httpx
 from bs4 import BeautifulSoup
 
-
 class TaiyoSource:
-    name = "Taiyō (PT-BR)"
-    base_url = "https://taiyo.moe"
-    imgcdn = "https://cdn.taiyo.moe/medias"
-
-    def __init__(self):
-        self.token = None
-
-    def _headers(self, token=None):
-        h = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": self.base_url + "/",
-        }
-        if token:
-            h["Authorization"] = f"Bearer {token}"
-        return h
-
-    async def _token(self, c):
-        if self.token:
-            return self.token
-        r = await c.get(self.base_url, headers=self._headers())
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        scripts = soup.find_all("script", src=True)
-        for s in reversed(scripts):
-            src = s["src"]
-            if not src.startswith("http"):
-                src = self.base_url + src
+    name='Taiyō (PT-BR)'; base='https://taiyo.moe'; imgcdn='https://cdn.taiyo.moe/medias'
+    def __init__(self): self.token=''
+    async def _token(self,c):
+        if self.token:return self.token
+        html=(await c.get(self.base)).text; soup=BeautifulSoup(html,'html.parser')
+        scripts=[]
+        for s in soup.select('script[src]'):
+            u=s.get('src'); scripts.append(u if u.startswith('http') else self.base+u)
+        for u in reversed(scripts):
             try:
-                js = (await c.get(src, headers=self._headers())).text
-            except Exception:
-                continue
-            m = re.search(r'NEXT_PUBLIC_MEILISEARCH_PUBLIC_KEY:\s*"([^"]+)"', js)
-            if m:
-                self.token = m.group(1)
-                return self.token
-        raise RuntimeError("Taiyō: token não encontrado")
-
-    async def search(self, query):
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
-            token = await self._token(c)
-            body = {"queries": [{"indexUid": "medias", "q": query, "filter": ["deletedAt IS NULL"], "limit": 50, "offset": 0}]}
-            r = await c.post(
-                "https://meilisearch.taiyo.moe/multi-search",
-                headers=self._headers(token),
-                json=body,
-            )
-            r.raise_for_status()
-            data = r.json()
-        hits = (data.get("results") or [{}])[0].get("hits", [])
-        out = []
+                t=(await c.get(u)).text
+                m=re.search(r'NEXT_PUBLIC_MEILISEARCH_PUBLIC_KEY:\s*"([^"]+)"',t)
+                if m: self.token=m.group(1); return self.token
+            except Exception: pass
+        # Sometimes the token is present in the page payload itself.
+        m=re.search(r'NEXT_PUBLIC_MEILISEARCH_PUBLIC_KEY.{0,10}["\']([^"\']+)',html)
+        if m:self.token=m.group(1);return self.token
+        raise RuntimeError('Token Taiyō não encontrado')
+    async def search(self,q):
+        async with httpx.AsyncClient(timeout=45,headers={'User-Agent':'Mozilla/5.0'}) as c:
+            tok=await self._token(c)
+            body={'queries':[{'indexUid':'medias','q':q,'filter':['deletedAt IS NULL'],'limit':21,'offset':0}]}
+            r=await c.post('https://meilisearch.taiyo.moe/multi-search',headers={'Authorization':f'Bearer {tok}'},json=body); r.raise_for_status(); d=r.json()
+        hits=(d.get('results') or [{}])[0].get('hits',[]); out=[]
         for x in hits:
-            titles = x.get("titles") or []
-            title = next((t.get("title") for t in titles if "pt" in str(t.get("language", "")).lower()), None)
-            title = title or (titles[0].get("title") if titles else None)
-            if title and x.get("id"):
-                out.append({"title": title, "url": str(x["id"])})
+            titles=x.get('titles') or []
+            title=next((t.get('title') for t in titles if 'pt' in str(t.get('language','')).lower()),None) or next((t.get('title') for t in titles if t.get('title')),None)
+            if title and x.get('id'): out.append({'title':title,'url':x['id']})
         return out
-
-    async def chapters(self, manga_id):
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
-            token = await self._token(c)
-            url = f"{self.base_url}/api/trpc/chapters.getByMediaId?batch=1"
-            inp = json.dumps({"0": {"json": {"mediaId": manga_id, "page": 1, "perPage": 100}}}, separators=(",", ":"))
-            r = await c.get(url, params={"input": inp}, headers=self._headers(token))
-            r.raise_for_status()
-            data = r.json()
-        obj = data[0].get("result", {}).get("data", {}).get("json", {})
-        out = []
-        for x in obj.get("chapters", []):
-            cid = x.get("id")
-            if not cid:
+    async def chapters(self,mid):
+        async with httpx.AsyncClient(timeout=45,headers={'User-Agent':'Mozilla/5.0'}) as c:
+            page=1; out=[]
+            while True:
+                inp={'0':{'json':{'mediaId':mid,'page':page,'perPage':50}}}
+                # tRPC response is a JSON array; the actual payload is nested under result.data.json.
+                r=await c.get(f'{self.base}/api/trpc/chapters.getByMediaId',params={'batch':'1','input':json.dumps(inp,separators=(',',':'))}); r.raise_for_status(); raw=r.text
+                m=re.search(r'"json":(\{"chapters".*?\})\s*\}',raw)
+                if not m: break
+                try: d=json.loads(m.group(1))
+                except Exception: break
+                rows=d.get('chapters') or []; out.extend(rows)
+                if page>=int(d.get('totalPages') or page) or not rows: break
+                page+=1
+        return [{'chapter_number':x.get('number'),'name':x.get('title') or f"Capítulo {x.get('number')}",'url':f"{self.base}/chapter/{x.get('id')}/1"} for x in sorted(out,key=lambda x: float(x.get('number') or 0),reverse=True) if x.get('id')]
+    async def pages(self,chapter_url):
+        async with httpx.AsyncClient(timeout=45,headers={'User-Agent':'Mozilla/5.0'}) as c:
+            r=await c.get(chapter_url); r.raise_for_status(); soup=BeautifulSoup(r.text,'html.parser')
+        scripts='\n'.join(s.get_text() for s in soup.find_all('script'))
+        # Mirror the extension's mediaChapter extraction without depending on a fragile HTML selector.
+        marker='\\"mediaChapter\\":'
+        idx=scripts.find(marker)
+        if idx<0: idx=scripts.find('"mediaChapter":')
+        if idx<0:return []
+        start=scripts.find('{',idx)
+        if start<0:return []
+        depth=0; end=-1; quoted=False; esc=False
+        for i in range(start,len(scripts)):
+            ch=scripts[i]
+            if quoted:
+                if esc: esc=False
+                elif ch=='\\': esc=True
+                elif ch=='"': quoted=False
                 continue
-            out.append({
-                "name": x.get("title") or f"Capítulo {x.get('number')}",
-                "chapter_number": x.get("number", 0),
-                "url": f"{cid}/1",
-                "manga_title": "Taiyō",
-            })
-        return out
-
-    @staticmethod
-    def _extract_media_chapter(html):
-        # Taiyō is Next.js and the reader payload is embedded/escaped in an RSC script.
-        soup = BeautifulSoup(html, "html.parser")
-        for script in soup.find_all("script"):
-            text = script.string or script.get_text()
-            if not text or "mediaChapter" not in text:
-                continue
-            # Mirror the parser used by the source: take the object after mediaChapter,
-            # stop before the chapters property, then unescape JSON.
-            marker = r'\"mediaChapter\":'
-            pos = text.find(marker)
-            if pos < 0:
-                marker = '"mediaChapter":'
-                pos = text.find(marker)
-                if pos < 0:
-                    continue
-            start = pos + len(marker)
-            tail = text[start:]
-            # Find the next escaped chapters field; this avoids greedy matching across RSC chunks.
-            end_candidates = [tail.find(r',\"chapters\":'), tail.find(',"chapters":')]
-            end = min([x for x in end_candidates if x >= 0], default=-1)
-            if end >= 0:
-                raw = tail[:end] + "}"
-            else:
-                raw = tail
-            raw = raw.replace('\\"', '"').replace('\\\\', '\\')
-            try:
-                return json.loads(raw)
-            except Exception:
-                # Fallback: find a balanced JSON object starting at the marker.
-                depth = 0
-                in_str = False
-                esc = False
-                for i, ch in enumerate(raw):
-                    if in_str:
-                        if esc:
-                            esc = False
-                        elif ch == "\\":
-                            esc = True
-                        elif ch == '"':
-                            in_str = False
-                    else:
-                        if ch == '"':
-                            in_str = True
-                        elif ch == "{":
-                            depth += 1
-                        elif ch == "}":
-                            depth -= 1
-                            if depth == 0:
-                                try:
-                                    return json.loads(raw[: i + 1])
-                                except Exception:
-                                    break
-        return None
-
-    async def pages(self, chapter_url):
-        # The chapter URL is /chapter/<chapter-id>/1. The page contains the
-        # mediaChapter object; pages are served as /medias/<media-id>/chapters/<chapter-id>/<page-id>.jpg
-        clean = str(chapter_url).strip().strip("/")
-        if clean.startswith("http"):
-            url = clean
-        else:
-            url = f"{self.base_url}/chapter/{clean}"
-
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
-            r = await c.get(url, headers=self._headers())
-            r.raise_for_status()
-            obj = self._extract_media_chapter(r.text)
-
-        if not obj:
-            return []
-        media = obj.get("media") or {}
-        media_id = media.get("id")
-        chapter_id = obj.get("id")
-        pages = obj.get("pages") or []
-        if not media_id or not chapter_id:
-            return []
-        return [
-            f"{self.imgcdn}/{media_id}/chapters/{chapter_id}/{p.get('id')}.jpg"
-            for p in pages
-            if p.get("id")
-        ]
+            if ch=='"': quoted=True
+            elif ch=='{': depth+=1
+            elif ch=='}':
+                depth-=1
+                if depth==0: end=i+1; break
+        if end<0:return []
+        raw=scripts[start:end].replace('\\"','"').replace('\\\\','\\')
+        try:d=json.loads(raw)
+        except Exception:return []
+        media=(d.get('media') or {}).get('id'); cid=d.get('id')
+        if not media or not cid:return []
+        return [f'{self.imgcdn}/{media}/chapters/{cid}/{p.get("id")}.jpg' for p in d.get('pages',[]) if p.get('id')]
