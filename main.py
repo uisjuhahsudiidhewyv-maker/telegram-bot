@@ -13,6 +13,7 @@ from telegram.ext import (
 
 from utils.loader import get_all_sources
 from utils.cbz import create_cbz
+from auth import authorized
 
 logging.basicConfig(level=logging.INFO)
 
@@ -22,6 +23,25 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
 SEARCH_CACHE = {}
 RESULTS_PER_PAGE = 10
 CHAPTERS_PER_PAGE = 15
+
+
+async def safe_delete(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+async def reject(update):
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("⛔ Usuário não autorizado", show_alert=True)
+        elif update.message:
+            await update.message.delete()
+    except Exception:
+        pass
+
+def target_from_message(message):
+    return {"chat_id": message.chat_id, "thread_id": getattr(message, "message_thread_id", None)}
 
 
 # ==========================================================
@@ -56,16 +76,17 @@ async def send_chapter(job):
         message = job["message"]
         source = job["source"]
         chapter = job["chapter"]
+        target = job.get("target") or target_from_message(message)
 
         try:
             pages = await source.pages(chapter["url"])
         except Exception as e:
             print(f"Erro ao obter páginas ({source.__class__.__name__}): {type(e).__name__}: {e}")
-            await message.reply_text("❌ Erro ao obter páginas.")
+            e=await message.reply_text("❌ Erro ao obter páginas."); await asyncio.sleep(2); await safe_delete(job["bot"], message.chat_id, e.message_id)
             return
 
         if not pages:
-            await message.reply_text("❌ Nenhuma página encontrada.")
+            e=await message.reply_text("❌ Nenhuma página encontrada."); await asyncio.sleep(2); await safe_delete(job["bot"], message.chat_id, e.message_id)
             return
 
         try:
@@ -76,10 +97,10 @@ async def send_chapter(job):
             )
         except Exception as e:
             print(f"Erro ao criar CBZ ({source.__class__.__name__}): {type(e).__name__}: {e}")
-            await message.reply_text("❌ Erro ao criar CBZ.")
+            e=await message.reply_text("❌ Erro ao criar CBZ."); await asyncio.sleep(2); await safe_delete(job["bot"], message.chat_id, e.message_id)
             return
 
-        await message.reply_document(document=cbz_buffer, filename=cbz_name)
+        await job["bot"].send_document(chat_id=target["chat_id"], message_thread_id=target.get("thread_id"), document=cbz_buffer, filename=cbz_name)
         cbz_buffer.close()
 
 
@@ -88,6 +109,10 @@ async def send_chapter(job):
 # ==========================================================
 
 async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not authorized(update.effective_user.id):
+        await reject(update)
+        return
 
     query_text = " ".join(context.args)
     if not query_text:
@@ -120,10 +145,14 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search_source(name, source, query):
     try:
         res = await source.search(query)
-        return [
-            {"source": name, "title": m["title"], "url": m["url"]}
-            for m in res
-        ]
+        q=" ".join(query.lower().split())
+        out=[]
+        for m in res:
+            title=str(m.get("title") or "")
+            norm=" ".join(title.lower().split())
+            if all(part in norm for part in q.split()):
+                out.append({"source":name,"title":title,"url":m.get("url")})
+        return out
     except:
         return []
 
@@ -216,9 +245,9 @@ async def show_chapters(message, context, page, user_id):
 async def change_page(update, context):
     query = update.callback_query
     await query.answer()
-    if not is_owner(query):
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ Não autorizado", show_alert=True)
         return
-
     page = int(query.data.split("|")[1])
     await show_results(query.message, query.from_user.id, page)
 
@@ -226,9 +255,9 @@ async def change_page(update, context):
 async def select_manga(update, context):
     query = update.callback_query
     await query.answer()
-    if not is_owner(query):
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ Não autorizado", show_alert=True)
         return
-
     index = int(query.data.split("|")[1])
     data = SEARCH_CACHE[query.message.message_id][index]
 
@@ -238,6 +267,8 @@ async def select_manga(update, context):
     context.user_data["chapters"] = chapters
     context.user_data["source"] = source
     context.user_data["title"] = data["title"]
+    context.user_data["target"] = target_from_message(query.message)
+    await safe_delete(context.bot, query.message.chat_id, query.message.message_id)
 
     user_id = query.from_user.id
 
@@ -255,29 +286,32 @@ async def select_manga(update, context):
 async def download_all(update, context):
     query = update.callback_query
     await query.answer()
-    if not is_owner(query):
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ Não autorizado", show_alert=True)
         return
-
     chapters = context.user_data["chapters"]
     source = context.user_data["source"]
+    target = context.user_data.get("target") or target_from_message(query.message)
 
     for chap in chapters:
         await DOWNLOAD_QUEUE.put({
             "message": query.message,
+            "target": target,
+            "bot": context.bot,
             "source": source,
             "chapter": chap,
             "title": context.user_data.get("title") or "Manga"
         })
 
-    await query.message.reply_text("📥 Todos capítulos adicionados na fila.")
+    await safe_delete(context.bot, query.message.chat_id, query.message.message_id)
 
 
 async def download_one(update, context):
     query = update.callback_query
     await query.answer()
-    if not is_owner(query):
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ Não autorizado", show_alert=True)
         return
-
     index = int(query.data.split("|")[1])
 
     chap = context.user_data["chapters"][index]
@@ -285,19 +319,21 @@ async def download_one(update, context):
 
     await DOWNLOAD_QUEUE.put({
         "message": query.message,
+        "target": context.user_data.get("target") or target_from_message(query.message),
+        "bot": context.bot,
         "source": source,
         "chapter": chap
     })
 
-    await query.message.reply_text("📥 Capítulo adicionado na fila.")
+    await safe_delete(context.bot, query.message.chat_id, query.message.message_id)
 
 
 async def change_chap_page(update, context):
     query = update.callback_query
     await query.answer()
-    if not is_owner(query):
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ Não autorizado", show_alert=True)
         return
-
     page = int(query.data.split("|")[1])
     await show_chapters(query.message, context, page, query.from_user.id)
 
@@ -305,9 +341,9 @@ async def change_chap_page(update, context):
 async def back_to_results(update, context):
     query = update.callback_query
     await query.answer()
-    if not is_owner(query):
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ Não autorizado", show_alert=True)
         return
-
     await show_results(query.message, query.from_user.id, 0)
 
 
