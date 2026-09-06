@@ -31,12 +31,15 @@ class WolftoonSource:
         r = await self.client.get(f"{self.supabase_url}/rest/v1/titles", params=params)
         data = r.json()
         results = []
+        # Pesquisa SOMENTE pelo título. A sinopse não participa do filtro.
+        query_norm = query.strip().lower()
         for manga in data:
-            if query.lower() in manga["title"].lower() or query.lower() in manga.get("synopsis","").lower():
+            title = str(manga.get("title") or "").strip()
+            if title and query_norm in title.lower():
                 results.append({
-                    "title": manga["title"],
+                    "title": title,
                     "url": manga["id"],  # usar ID para buscar capítulos
-                    "manga_title": manga["title"]
+                    "manga_title": title
                 })
         return results
 
