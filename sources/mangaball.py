@@ -1,121 +1,92 @@
-import httpx
-import re
 import json
+import re
+import httpx
 from bs4 import BeautifulSoup
 
-
 class MangaBallSource:
-    name = "MangaBall (PT-BR)"
-    base_url = "https://mangaball.net"
-
-    def _headers(self, csrf=None):
-        h = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139 Safari/537.36",
-            "Referer": self.base_url + "/",
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
-        }
-        if csrf:
-            h["X-CSRF-TOKEN"] = csrf
-        return h
-
-    async def _csrf(self, client):
-        r = await client.get(self.base_url, headers=self._headers())
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        meta = soup.select_one('meta[name="csrf-token"]')
-        if meta and meta.get("content"):
-            return meta["content"]
-        # Fallback for pages that expose the token in inline JS.
-        m = re.search(r'(?:csrf-token|csrfToken)["\']?\s*[:=]\s*["\']([^"\']+)', r.text, re.I)
-        return m.group(1) if m else None
-
-    async def search(self, query):
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
-            csrf = await self._csrf(c)
-            r = await c.post(
-                f"{self.base_url}/api/v1/smart-search/search/",
-                headers=self._headers(csrf),
-                data={"search_input": query.strip()},
-            )
-            if r.status_code == 403 and csrf:
-                csrf = await self._csrf(c)
-                r = await c.post(
-                    f"{self.base_url}/api/v1/smart-search/search/",
-                    headers=self._headers(csrf),
-                    data={"search_input": query.strip()},
-                )
-            r.raise_for_status()
-            data = r.json()
-
-        out = []
-        for m in data.get("data", {}).get("manga", []):
-            title = m.get("title")
-            url = m.get("url")
-            if title and url:
-                # The official source stores the slug in /title-detail/<slug>/.
-                parts = url.rstrip("/").split("/")
-                slug = parts[-1] if parts else url
-                out.append({"title": title, "url": slug})
-        return out
-
-    async def chapters(self, manga_id):
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
-            csrf = await self._csrf(c)
-            r = await c.post(
-                f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
-                headers=self._headers(csrf),
-                data={"title_id": manga_id},
-            )
-            if r.status_code == 403:
-                csrf = await self._csrf(c)
-                r = await c.post(
-                    f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
-                    headers=self._headers(csrf),
-                    data={"title_id": manga_id},
-                )
-            r.raise_for_status()
-            data = r.json()
-
-        out = []
-        for ch in data.get("chapters", []):
-            num = ch.get("number", 0)
-            for tr in ch.get("translations", []):
-                lang = str(tr.get("language") or "").lower()
-                if lang not in ("pt-br", "pt-pt", "pt"):
-                    continue
-                cid = tr.get("id")
-                if not cid:
-                    continue
-                out.append({
-                    "name": tr.get("name") or f"Cap. {num}",
-                    "chapter_number": num,
-                    "url": cid,
-                    "manga_title": "MangaBall",
-                })
-        return out
-
-    async def pages(self, chapter_id):
-        async with httpx.AsyncClient(
-            headers=self._headers(), timeout=40, follow_redirects=True
-        ) as c:
-            r = await c.get(f"{self.base_url}/chapter-detail/{chapter_id}/")
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-
-        # This is the same reader payload used by the original source.
-        script = ";".join(x.get_text() if not x.string else x.string for x in soup.find_all("script"))
-        m = re.search(r"const\s+chapterImages\s*=\s*JSON\.parse\(`([^`]+)`\)", script)
-        if not m:
-            # Some deployments expose the array directly.
-            m = re.search(r"chapterImages\s*=\s*(\[[^;]+\])", script, re.S)
-        if not m:
-            return []
-        raw = m.group(1)
+    name='MangaBall (PT-BR)'
+    base='https://mangaball.net'
+    headers={
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139 Safari/537.36',
+        'Accept':'*/*','Accept-Language':'pt-BR,pt;q=0.9,en;q=0.8',
+        'X-Requested-With':'XMLHttpRequest','Referer':base+'/'
+    }
+    async def _client(self):
+        c=httpx.AsyncClient(timeout=45,headers=self.headers,follow_redirects=True)
+        r=await c.get(self.base+'/')
+        soup=BeautifulSoup(r.text,'html.parser')
+        token=soup.select_one('meta[name="csrf-token"]')
+        if token and token.get('content'):
+            c.headers['X-CSRF-TOKEN']=token['content']
+        return c
+    @staticmethod
+    def _abs(base,url):
+        if not url:return ''
+        if url.startswith('//'):return 'https:'+url
+        if url.startswith('/'):return base+url
+        return url
+    async def search(self,q):
+        c=await self._client()
         try:
-            return json.loads(raw)
-        except Exception:
-            try:
-                return json.loads(bytes(raw, "utf-8").decode("unicode_escape"))
-            except Exception:
-                return []
+            r=await c.post(self.base+'/api/v1/smart-search/search/',data={'search_input':q.strip()})
+            r.raise_for_status(); d=r.json()
+            items=((d.get('data') or {}).get('manga') or [])
+            out=[]
+            for x in items:
+                title=x.get('title') or x.get('name')
+                url=x.get('url')
+                if title and url:
+                    out.append({'title':title,'url':self._abs(self.base,url)})
+            return out
+        finally: await c.aclose()
+    async def chapters(self,url):
+        c=await self._client()
+        try:
+            # The source's current extension derives title_id from the final URL slug.
+            slug=str(url).rstrip('/').split('/')[-1]
+            title_id=slug.rsplit('-',1)[-1]
+            if not title_id or not title_id.isdigit():
+                title_id=slug
+            r=await c.post(self.base+'/api/v1/chapter/chapter-listing-by-title-id/',data={'title_id':title_id})
+            r.raise_for_status(); d=r.json()
+            groups=d.get('chapters') or d.get('ALL_CHAPTERS') or (d.get('data') or {}).get('chapters') or (d.get('data') or {}).get('ALL_CHAPTERS') or []
+            out=[]
+            for ch in groups:
+                num=ch.get('number') or ch.get('number_float') or ch.get('chapter') or '0'
+                for tr in ch.get('translations') or []:
+                    lang=str(tr.get('language') or '').lower()
+                    if lang not in ('pt-br','pt','pt_pt','pt-pt'): continue
+                    cid=tr.get('id') or tr.get('url')
+                    if not cid: continue
+                    out.append({'chapter_number':num,'name':tr.get('name') or f'Capítulo {num}','url':cid})
+            # Fallback when the API returns a flat chapter list.
+            if not out:
+                for ch in groups:
+                    cid=ch.get('id') or ch.get('url')
+                    if cid: out.append({'chapter_number':ch.get('number') or ch.get('chapter') or '0','name':ch.get('title') or ch.get('name') or 'Capítulo','url':cid})
+            return sorted(out,key=lambda x: float(str(x.get('chapter_number','0')).replace(',','.').split('-')[0]) if re.match(r'^\d+(?:[.,]\d+)?',str(x.get('chapter_number','0'))) else 0, reverse=True)
+        finally: await c.aclose()
+    async def pages(self,chapter_url):
+        if not str(chapter_url).startswith('http'):
+            chapter_url=self.base+'/chapter-detail/'+str(chapter_url).strip('/')+'/'
+        c=await self._client()
+        try:
+            r=await c.get(chapter_url); r.raise_for_status()
+            soup=BeautifulSoup(r.text,'html.parser')
+            scripts='\n'.join(s.get_text() for s in soup.find_all('script'))
+            m=re.search(r'const\s+chapterImages\s*=\s*JSON\.parse\(`([^`]+)`\)',scripts)
+            if m:
+                raw=m.group(1).replace('\\`','`')
+                try:
+                    arr=json.loads(raw)
+                    return [self._abs(self.base,x) for x in arr if isinstance(x,str)]
+                except Exception: pass
+            # Generic fallback for direct image arrays/DOM images.
+            for pattern in [r'chapterImages\s*=\s*(\[[^;]+\])',r'"chapterImages"\s*:\s*(\[[^]]+\])']:
+                m=re.search(pattern,scripts,re.S)
+                if m:
+                    try:
+                        arr=json.loads(m.group(1)); return [self._abs(self.base,x) for x in arr if isinstance(x,str)]
+                    except Exception: pass
+            return [self._abs(self.base,img.get('data-src') or img.get('src')) for img in soup.select('img') if (img.get('data-src') or img.get('src')) and not 'logo' in (img.get('src') or '').lower()]
+        finally: await c.aclose()
