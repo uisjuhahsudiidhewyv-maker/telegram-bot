@@ -197,10 +197,20 @@ async def send_chapter(job):
             return
 
         try:
+            # Algumas fontes (principalmente leitores/CDNs) exigem Referer.
+            chapter_url = str(chapter.get("url") or "")
+            referer = chapter_url if chapter_url.startswith("http") else None
+            image_headers = {"User-Agent": "Mozilla/5.0"}
+            if source.__class__.__name__ == "TaiyoSource":
+                image_headers["Referer"] = "https://taiyo.moe/"
+            elif referer:
+                image_headers["Referer"] = referer
+
             cbz_buffer, cbz_name = await create_cbz(
                 pages,
                 chapter.get("manga_title", "Manga"),
                 f"Cap_{chapter.get('chapter_number')}",
+                image_headers=image_headers,
             )
         except Exception:
             try:
