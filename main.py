@@ -258,9 +258,29 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = await asyncio.gather(*tasks)
 
+    # Junta os resultados de TODAS as fontes.
+    # A filtragem é feita exclusivamente pelo título pesquisado.
     combined = []
-    for r in results:
-        combined.extend(r)
+    seen = set()
+
+    for source_results in results:
+        for item in source_results:
+            # Evita duplicatas da mesma obra dentro da mesma fonte.
+            key = (
+                item["source"],
+                _normalize_search_text(item["title"]),
+                str(item["url"])
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(item)
+
+    # Ordenação previsível: título e depois fonte.
+    combined.sort(key=lambda x: (
+        _normalize_search_text(x["title"]),
+        _normalize_search_text(x["source"])
+    ))
 
     if not combined:
         await msg.edit_text("❌ Nenhum resultado encontrado.")
@@ -271,14 +291,59 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_results(msg, user_id, 0)
 
 
+def _normalize_search_text(text):
+    """Normaliza o texto apenas para comparação da pesquisa."""
+    import re
+    import unicodedata
+
+    text = str(text or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _matches_search(title, query):
+    """
+    O filtro final usa SOMENTE o título do mangá.
+
+    Todas as palavras pesquisadas precisam aparecer no título. Isso evita
+    resultados que uma fonte encontrou apenas por sinopse, descrição, autor,
+    etc. Ex.: 'solo leveling' só aceita títulos que contenham 'solo' e
+    'leveling'.
+    """
+    title_norm = _normalize_search_text(title)
+    query_words = _normalize_search_text(query).split()
+
+    if not title_norm or not query_words:
+        return False
+
+    return all(word in title_norm for word in query_words)
+
+
 async def search_source(name, source, query):
     try:
-        res = await source.search(query)
-        return [
-            {"source": name, "title": m["title"], "url": m["url"]}
-            for m in res
-        ]
-    except Exception:
+        res = await source.search(query) or []
+        filtered = []
+
+        for manga in res:
+            title = str(manga.get("title") or "").strip()
+            url = manga.get("url")
+
+            # O resultado só entra se o TÍTULO realmente corresponder
+            # à pesquisa. Não usamos sinopse, autor ou descrição.
+            if not title or not url or not _matches_search(title, query):
+                continue
+
+            filtered.append({
+                "source": name,
+                "title": title,
+                "url": url
+            })
+
+        return filtered
+    except Exception as e:
+        print(f"[{name}] erro na busca: {e}")
         return []
 
 
