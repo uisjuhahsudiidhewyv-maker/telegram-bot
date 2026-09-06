@@ -1,111 +1,88 @@
-from typing import List
-from urllib.parse import urlparse, urljoin, quote_plus
+from urllib.parse import quote_plus, urljoin
 import httpx
 from bs4 import BeautifulSoup
 
 
-class NineMangaSource:
-    """Adapted from Codeflix-Bots/Manga-Bot plugins/ninemanga.py."""
-    name = "NineManga"
-    base_url = "https://www.ninemanga.com/"
-    search_url = urljoin(base_url, "search/")
-    query_param = "waring=1"
+class NineMangaCodeflixSource:
+    name = "NineManga Brasil"
+    base_url = "https://br.ninemanga.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:97.0) Gecko/20100101 Firefox/97.0",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.5",
     }
+    timeout = httpx.Timeout(30.0, connect=15.0)
 
     async def _get(self, url):
-        async with httpx.AsyncClient(headers=self.headers, timeout=60, follow_redirects=True) as client:
+        async with httpx.AsyncClient(headers=self.headers, timeout=self.timeout, follow_redirects=True) as client:
             r = await client.get(url)
             r.raise_for_status()
             return r
 
-    def _soup(self, content):
-        return BeautifulSoup(content, "html.parser")
-
     async def search(self, query: str):
-        r = await self._get(self.search_url + "?wd=" + quote_plus(query))
-        bs = self._soup(r.content)
-        container = bs.find("ul", {"class": "direlist"})
+        url = urljoin(self.base_url, f"search/?wd={quote_plus(query)}")
+        r = await self._get(url)
+        soup = BeautifulSoup(r.content, "html.parser")
+        container = soup.find("ul", class_="direlist")
         if not container:
             return []
         results = []
         for card in container.find_all("li"):
-            a = card.find("a", {"class": "bookname"})
-            img = card.find("img")
-            if not a or not a.get("href"):
+            a = card.find("a", class_="bookname")
+            if not a:
                 continue
-            results.append({
-                "title": a.get_text(" ", strip=True).title(),
-                "url": urljoin(self.base_url, a["href"]),
-                "picture_url": urljoin(self.base_url, img.get("src")) if img and img.get("src") else "",
-            })
+            title = a.get_text(strip=True)
+            href = urljoin(self.base_url, a.get("href", ""))
+            if title and href:
+                results.append({"title": title, "url": href})
         return results
 
     async def chapters(self, manga_url: str):
-        url = manga_url + ("&" if "?" in manga_url else "?") + self.query_param
+        url = f"{manga_url}?waring=1"
         r = await self._get(url)
-        bs = self._soup(r.content)
-        container = bs.find("div", {"class": "chapterbox"})
+        soup = BeautifulSoup(r.content, "html.parser")
+        container = soup.find("div", class_="chapterbox")
         if not container:
             return []
-        chapters = []
+        results = []
         for li in container.find_all("li"):
             a = li.find("a")
-            if not a or not a.get("href"):
+            if not a:
                 continue
-            title = (a.get("title") or a.get_text(" ", strip=True) or "Capítulo").strip()
-            chapters.append({
-                "name": title,
-                "chapter_number": self._chapter_number(title),
-                "url": urljoin(self.base_url, a["href"]),
+            href = urljoin(self.base_url, a.get("href", ""))
+            name = (a.get("title") or a.get_text(strip=True)).strip()
+            results.append({
+                "name": name,
+                "chapter_number": name,
+                "url": href,
                 "manga_title": "",
             })
-        return chapters
-
-    @staticmethod
-    def _chapter_number(text):
-        import re
-        m = re.search(r"\d+(?:\.\d+)?", text or "")
-        return m.group(0) if m else "0"
+        return results
 
     async def pages(self, chapter_url: str):
-        # Mirrors the Codeflix strategy: inspect the page selector and request
-        # the paginated chapter pages where the site exposes them.
         r = await self._get(chapter_url)
-        bs = self._soup(r.content)
-        container = bs.find("select", {"id": "page"})
-        options = container.find_all("option") if container else []
-
-        images = [
-            urljoin(str(r.url), img.get("src"))
-            for img in bs.find_all("img", {"class": "manga_pic"})
-            if img.get("src")
-        ]
-
+        soup = BeautifulSoup(r.content, "html.parser")
+        container = soup.find("select", id="page")
+        if not container:
+            return []
+        total = len(container.find_all("option"))
+        if total <= 0:
+            return []
+        # Mantém a lógica do projeto Codeflix: o site agrupa 10 páginas por URL.
         count = 10
-        total = len(options)
-        page_count = (total - 1) // count if total else 0
-        chapter_str = str(r.url)
-        if chapter_str.endswith(".html"):
-            chapter_base = chapter_str[:-5]
-            for page in range(page_count):
-                url = f"{chapter_base}-{count}-{page + 1}.html"
-                try:
-                    pr = await self._get(url)
-                    pbs = self._soup(pr.content)
-                    images.extend(
-                        urljoin(str(pr.url), img.get("src"))
-                        for img in pbs.find_all("img", {"class": "manga_pic"})
-                        if img.get("src")
-                    )
-                except Exception as e:
-                    print(f"[NineManga] página adicional falhou: {e}")
-
-        # preserve order and remove duplicates
-        out, seen = [], set()
-        for u in images:
-            if u and u not in seen:
-                seen.add(u); out.append(u)
-        return out
+        pages = (total - 1) // count
+        images = []
+        base = str(r.url)
+        if base.endswith(".html"):
+            base = base[:-5]
+        for page in range(pages):
+            page_url = f"{base}-{count}-{page + 1}.html"
+            try:
+                pr = await self._get(page_url)
+            except Exception:
+                continue
+            psoup = BeautifulSoup(pr.content, "html.parser")
+            for img in psoup.find_all("img", class_="manga_pic"):
+                src = img.get("src")
+                if src:
+                    images.append(urljoin(str(pr.url), src))
+        return images
