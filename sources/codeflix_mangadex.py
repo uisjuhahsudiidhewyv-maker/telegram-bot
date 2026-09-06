@@ -1,84 +1,84 @@
-import json
+import asyncio
 from urllib.parse import quote
 import httpx
 
 
-class MangaDexSource:
-    """Adapted from Codeflix-Bots/Manga-Bot plugins/mangadex.py."""
+class MangaDexCodeflixSource:
     name = "MangaDex (PT-BR)"
     api = "https://api.mangadex.org"
-    covers = "https://uploads.mangadex.org/covers"
-    headers = {"User-Agent": "MangaBot/Codeflix-compatible"}
+    headers = {"User-Agent": "MangaBot/1.0 (compatible; Codeflix logic)"}
+    timeout = httpx.Timeout(30.0, connect=15.0)
 
-    async def _get(self, url, params=None):
-        async with httpx.AsyncClient(headers=self.headers, timeout=60, follow_redirects=True) as client:
-            r = await client.get(url, params=params)
+    async def _get_json(self, path, params=None):
+        async with httpx.AsyncClient(headers=self.headers, timeout=self.timeout, follow_redirects=True) as client:
+            r = await client.get(f"{self.api}{path}", params=params)
             r.raise_for_status()
             return r.json()
 
     async def search(self, query: str):
+        if not query.strip():
+            return []
         params = [
-            ("limit", 20), ("offset", 0), ("includes[]", "cover_art"),
-            ("includes[]", "author"), ("includes[]", "artist"),
-            ("contentRating[]", "safe"), ("contentRating[]", "suggestive"),
-            ("contentRating[]", "erotica"), ("title", query), ("order[relevance]", "desc")
+            ("limit", 20),
+            ("offset", 0),
+            ("includes[]", "cover_art"),
+            ("contentRating[]", "safe"),
+            ("contentRating[]", "suggestive"),
+            ("contentRating[]", "erotica"),
+            ("title", query.strip()),
+            ("order[relevance]", "desc"),
         ]
-        data = await self._get(f"{self.api}/manga", params=params)
+        data = await self._get_json("/manga", params)
         results = []
         for card in data.get("data", []):
             attrs = card.get("attributes", {})
-            titles = attrs.get("title", {}) or {}
-            # Prefer Brazilian Portuguese, then English, then any title.
-            title = titles.get("pt-br") or titles.get("pt_br") or titles.get("en") or next(iter(titles.values()), None)
-            if not title:
-                continue
-            cover = ""
-            for rel in card.get("relationships", []):
-                if rel.get("type") == "cover_art":
-                    fn = (rel.get("attributes") or {}).get("fileName")
-                    if fn:
-                        cover = f"{self.covers}/{card['id']}/{fn}.512.jpg"
-                    break
-            results.append({"title": title, "url": card["id"], "picture_url": cover})
+            titles = attrs.get("title") or {}
+            title = titles.get("pt-br") or titles.get("en") or next(iter(titles.values()), None)
+            if title:
+                results.append({"title": title, "url": card["id"]})
         return results
 
     async def chapters(self, manga_id: str):
         params = [
-            ("limit", 500), ("offset", 0), ("includes[]", "scanlation_group"),
-            ("includes[]", "user"), ("order[volume]", "desc"), ("order[chapter]", "desc"),
-            ("contentRating[]", "safe"), ("contentRating[]", "suggestive"),
-            ("contentRating[]", "erotica"), ("contentRating[]", "pornographic"),
-            ("translatedLanguage[]", "pt-br"), ("translatedLanguage[]", "pt")
+            ("limit", 500),
+            ("offset", 0),
+            ("translatedLanguage[]", "pt-br"),
+            ("includes[]", "scanlation_group"),
+            ("includes[]", "user"),
+            ("order[volume]", "desc"),
+            ("order[chapter]", "desc"),
+            ("contentRating[]", "safe"),
+            ("contentRating[]", "suggestive"),
+            ("contentRating[]", "erotica"),
+            ("contentRating[]", "pornographic"),
         ]
-        data = await self._get(f"{self.api}/manga/{manga_id}/feed", params=params)
-        chapters, visited = [], set()
-        for ch in data.get("data", []):
-            attrs = ch.get("attributes", {})
+        data = await self._get_json(f"/manga/{manga_id}/feed", params)
+        chapters = []
+        visited = set()
+        for item in data.get("data", []):
+            attrs = item.get("attributes", {})
             number = attrs.get("chapter")
-            # Same deduplication principle used by Codeflix.
-            key = str(number) if number is not None else ch.get("id")
-            if key in visited:
+            if number in visited:
                 continue
-            visited.add(key)
-            label = str(number or "0")
-            if attrs.get("title"):
-                label += " - " + attrs["title"]
+            visited.add(number)
+            title = attrs.get("title") or ""
+            display = f"{number} - {title}" if title else str(number or "")
             chapters.append({
-                "name": label,
+                "name": display,
                 "chapter_number": number or "0",
-                "url": ch["id"],
+                "url": item.get("id"),
                 "manga_title": "",
             })
         return chapters
 
     async def pages(self, chapter_id: str):
-        data = await self._get(f"{self.api}/at-home/server/{chapter_id}", params={"forcePort443": "false"})
+        data = await self._get_json(f"/at-home/server/{chapter_id}", {"forcePort443": "false"})
         if data.get("result") == "error":
             return []
         base = data.get("baseUrl")
         chapter = data.get("chapter") or {}
-        h = chapter.get("hash")
+        chapter_hash = chapter.get("hash")
         files = chapter.get("data") or []
-        if not base or not h:
+        if not base or not chapter_hash:
             return []
-        return [f"{base}/data/{h}/{name}" for name in files]
+        return [f"{base}/data/{chapter_hash}/{name}" for name in files if name]
