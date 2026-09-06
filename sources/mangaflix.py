@@ -2,116 +2,112 @@ import httpx
 
 
 class MangaFlixSource:
+    """MangaFlix adapter baseado na implementação oficial da extensão Tachiyomi/Keiyoushi."""
+
     name = "MangaFlix"
     base_url = "https://mangaflix.net"
     api_url = "https://api.mangaflix.net/v1"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "pt-BR,pt;q=0.9",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
         "Origin": base_url,
         "Referer": base_url + "/",
-        "Connection": "keep-alive"
     }
 
-    timeout = httpx.Timeout(60.0)
+    timeout = httpx.Timeout(60.0, connect=20.0)
 
-    # ================= SEARCH =================
-    async def search(self, query: str):
-        if not query:
-            return []
-
-        url = f"{self.api_url}/search/mangas"
-
-        params = {
-            "query": query,
-            "selected_language": "pt-br"
-        }
-
+    async def _get_json(self, path, params=None):
         async with httpx.AsyncClient(
             headers=self.headers,
             timeout=self.timeout,
-            http2=False  # força HTTP/1.1
+            follow_redirects=True,
+            http2=False,
         ) as client:
+            response = await client.get(f"{self.api_url}{path}", params=params)
+            response.raise_for_status()
+            return response.json()
 
-            r = await client.get(url, params=params)
+    # ================= SEARCH =================
+    async def search(self, query: str):
+        query = (query or "").strip()
+        if not query:
+            return []
 
-            if r.status_code != 200:
-                print("Search error:", r.status_code, r.text)
-                return []
+        # A API do MangaFlix retorna os resultados em data.works.
+        data = await self._get_json(
+            "/search/mangas",
+            {"query": query, "selected_language": "pt-br"},
+        )
 
-            data = r.json()
+        payload = data.get("data") or {}
+        works = payload.get("works") or []
 
         results = []
+        for item in works:
+            manga_id = item.get("_id")
+            title = (item.get("name") or "").strip()
+            if manga_id and title:
+                results.append({
+                    "title": title,
+                    "url": manga_id,
+                })
 
-        for item in data.get("data", []):
-            results.append({
-                "title": item.get("name"),
-                "url": item.get("_id")
-            })
-
+        print(f"MangaFlix | busca={query!r} | resultados={len(results)}")
         return results
 
     # ================= CHAPTERS =================
     async def chapters(self, manga_id: str):
-        url = f"{self.api_url}/mangas/{manga_id}"
+        manga_id = str(manga_id).strip()
+        if not manga_id:
+            return []
 
-        async with httpx.AsyncClient(
-            headers=self.headers,
-            timeout=self.timeout,
-            http2=False
-        ) as client:
-
-            r = await client.get(url)
-
-            if r.status_code != 200:
-                print("Chapters error:", r.status_code, r.text)
-                return []
-
-            data = r.json()
-
-        manga_data = data.get("data", {})
-        manga_title = manga_data.get("name", "Manga")
+        data = await self._get_json(f"/mangas/{manga_id}")
+        manga_data = data.get("data") or {}
+        manga_title = manga_data.get("name") or "Manga"
 
         chapters = []
+        for chapter in manga_data.get("chapters") or []:
+            chapter_id = chapter.get("_id")
+            number = chapter.get("number")
+            if not chapter_id:
+                continue
 
-        for chapter in manga_data.get("chapters", []):
+            name = chapter.get("name")
+            display_name = (name or "").strip() or f"Capítulo {number}"
             chapters.append({
-                "name": f"Capítulo {chapter.get('number')}",
-                "chapter_number": chapter.get("number"),
-                "url": chapter.get("_id"),
-                "manga_title": manga_title
+                "name": display_name,
+                "chapter_number": number,
+                "url": chapter_id,
+                "manga_title": manga_title,
             })
 
         return chapters
 
     # ================= PAGES =================
     async def pages(self, chapter_id: str):
-        url = f"{self.api_url}/chapters/{chapter_id}"
+        chapter_id = str(chapter_id).strip()
+        if not chapter_id:
+            return []
 
-        params = {
-            "selected_language": "pt-br"
-        }
+        data = await self._get_json(
+            f"/chapters/{chapter_id}",
+            {"selected_language": "pt-br"},
+        )
 
-        async with httpx.AsyncClient(
-            headers=self.headers,
-            timeout=self.timeout,
-            http2=False
-        ) as client:
+        chapter_data = data.get("data") or {}
+        images = chapter_data.get("images") or []
 
-            r = await client.get(url, params=params)
+        urls = []
+        for image in images:
+            url = image.get("default_url") if isinstance(image, dict) else None
+            if url:
+                urls.append(url)
 
-            if r.status_code != 200:
-                print("Pages error:", r.status_code, r.text)
-                return []
-
-            data = r.json()
-
-        images = data.get("data", {}).get("images", [])
-
-        return [
-            img.get("default_url")
-            for img in images
-            if img.get("default_url")
-        ]
+        print(f"MangaFlix | capítulo={chapter_id} | páginas={len(urls)}")
+        return urls
