@@ -637,7 +637,7 @@ async def download_worker(application):
                     log.info("Download cancelado antes do CBZ | %s | %s", job["source_name"], chap.get("name"))
                     continue
                 try:
-                    cbz_buffer, cbz_name = await create_cbz(pages, job["title"], f"Cap_{chap.get('chapter_number')}")
+                    cbz_buffer, cbz_name = await create_cbz(pages, job["title"], f"Capítulo {chap.get('chapter_number')}")
                     cbz_buffer.seek(0)
                     await application.bot.send_document(
                         chat_id=job["chat_id"], document=cbz_buffer, filename=cbz_name,
