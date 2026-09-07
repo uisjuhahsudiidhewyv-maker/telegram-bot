@@ -29,6 +29,7 @@ CHAPTERS_PER_PAGE = 15
 TEMP_ERROR_SECONDS = 5
 SESSION_TTL = 600
 ACTIVE_BATCHES = {}
+BATCH_PROGRESS = {}
 
 
 def norm(text):
@@ -257,7 +258,11 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_delete(search_msg)
 
     # Invalidar imediatamente qualquer lote de downloads desse usuário.
-    ACTIVE_BATCHES.pop(user_id, None)
+    batch_id = ACTIVE_BATCHES.pop(user_id, None)
+    if batch_id:
+        progress = BATCH_PROGRESS.pop(batch_id, None)
+        if progress:
+            await safe_delete(progress.get("message"))
 
     session = SESSIONS.pop(key, None)
     if session:
@@ -405,6 +410,21 @@ async def enqueue(update, context, chapters):
         return
     batch_id = uuid4().hex
     ACTIVE_BATCHES[q.from_user.id] = batch_id
+    progress_msg = await context.bot.send_message(
+        q.message.chat_id,
+        f"📥 <b>Download em andamento</b>\n\n📖 {session['title']}\n📊 0/{len(chapters)} capítulos\n⏳ Preparando...",
+        parse_mode="HTML",
+        message_thread_id=session["thread_id"],
+    )
+    BATCH_PROGRESS[batch_id] = {
+        "message": progress_msg,
+        "total": len(chapters),
+        "done": 0,
+        "ok": 0,
+        "failed": 0,
+        "title": session["title"],
+        "lock": asyncio.Lock(),
+    }
     for chap in chapters:
         await DOWNLOAD_QUEUE.put({
             "chat_id": q.message.chat_id,
@@ -539,6 +559,57 @@ async def session_cleaner(application):
             log.info("Sessão expirada e rastros temporários removidos | chat=%s", chat_id)
 
 
+async def update_progress(application, job, success=None, chapter_name=""):
+    batch_id = job.get("batch_id")
+    progress = BATCH_PROGRESS.get(batch_id)
+    if not progress:
+        return
+    async with progress["lock"]:
+        if success is True:
+            progress["ok"] += 1
+        elif success is False:
+            progress["failed"] += 1
+        progress["done"] += 1
+        done = progress["done"]
+        total = progress["total"]
+        ok = progress["ok"]
+        failed = progress["failed"]
+        if done >= total:
+            text = (
+                f"📥 <b>Download finalizado</b>\n\n"
+                f"📖 {progress['title']}\n"
+                f"📊 {done}/{total} capítulos\n"
+                f"✅ {ok}  |  ❌ {failed}"
+            )
+            try:
+                await progress["message"].edit_text(text, parse_mode="HTML")
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            await safe_delete(progress["message"])
+            BATCH_PROGRESS.pop(batch_id, None)
+            if ACTIVE_BATCHES.get(job["user_id"]) == batch_id:
+                ACTIVE_BATCHES.pop(job["user_id"], None)
+            return
+        pct = int(done * 100 / total) if total else 100
+        bar_len = 10
+        filled = int(pct * bar_len / 100)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        current = chapter_name or "Processando..."
+        text = (
+            f"📥 <b>Download em andamento</b>\n\n"
+            f"📖 {progress['title']}\n"
+            f"📊 {done}/{total} capítulos ({pct}%)\n"
+            f"[{bar}]\n"
+            f"✅ {ok}  |  ❌ {failed}\n"
+            f"📄 {current}"
+        )
+        try:
+            await progress["message"].edit_text(text, parse_mode="HTML")
+        except Exception:
+            pass
+
+
 async def download_worker(application):
     while True:
         job = await DOWNLOAD_QUEUE.get()
@@ -555,10 +626,12 @@ async def download_worker(application):
                 except Exception as e:
                     log.warning("Páginas | %s | %s | ERRO | %s", job["source_name"], chap.get("name"), e)
                     await temp_error(application.bot, job["chat_id"], "❌ Erro ao obter páginas.", job["thread_id"])
+                    await update_progress(application, job, False, chap.get("name"))
                     continue
                 if not pages:
                     log.warning("Páginas | %s | %s | VAZIO", job["source_name"], chap.get("name"))
                     await temp_error(application.bot, job["chat_id"], "❌ Nenhuma página encontrada.", job["thread_id"])
+                    await update_progress(application, job, False, chap.get("name"))
                     continue
                 if ACTIVE_BATCHES.get(job["user_id"]) != job.get("batch_id"):
                     log.info("Download cancelado antes do CBZ | %s | %s", job["source_name"], chap.get("name"))
@@ -572,9 +645,11 @@ async def download_worker(application):
                     )
                     cbz_buffer.close()
                     log.info("Download | %s | %s | OK | %d páginas", job["source_name"], chap.get("name"), len(pages))
+                    await update_progress(application, job, True, chap.get("name"))
                 except Exception as e:
                     log.exception("CBZ | %s | %s | ERRO", job["source_name"], chap.get("name"))
                     await temp_error(application.bot, job["chat_id"], "❌ Erro ao criar/enviar CBZ.", job["thread_id"])
+                    await update_progress(application, job, False, chap.get("name"))
         finally:
             DOWNLOAD_QUEUE.task_done()
 
