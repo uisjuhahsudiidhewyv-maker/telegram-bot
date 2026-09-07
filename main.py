@@ -24,7 +24,6 @@ SESSIONS = {}
 SEARCH_LOCKS = defaultdict(asyncio.Lock)
 SEARCH_TASKS = {}
 SEARCH_MESSAGES = {}
-COMMAND_MESSAGES = {}
 RESULTS_PER_PAGE = 10
 CHAPTERS_PER_PAGE = 15
 TEMP_ERROR_SECONDS = 5
@@ -53,36 +52,15 @@ def owner_ok(query):
 async def safe_delete(message):
     if not message:
         return False
-    chat_id = getattr(message, "chat_id", None)
-    message_id = getattr(message, "message_id", None)
-    bot = getattr(message, "_bot", None)
     for attempt in range(3):
         try:
-            if bot is not None and chat_id is not None and message_id is not None:
-                await bot.delete_message(chat_id=chat_id, message_id=message_id)
-            else:
-                await message.delete()
+            await message.delete()
             return True
         except Exception as e:
             if attempt < 2:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.4)
             else:
-                log.warning("Não foi possível apagar mensagem | chat=%s | message=%s | %s", chat_id, message_id, e)
-    return False
-
-
-async def safe_delete_by_id(bot, chat_id, message_id, label="mensagem"):
-    if not chat_id or not message_id:
-        return False
-    for attempt in range(3):
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-            return True
-        except Exception as e:
-            if attempt < 2:
-                await asyncio.sleep(0.5)
-            else:
-                log.warning("Não foi possível apagar %s | chat=%s | message=%s | %s", label, chat_id, message_id, e)
+                log.debug("Não foi possível apagar mensagem %s: %s", getattr(message, "message_id", "?"), e)
     return False
 
 
@@ -174,6 +152,90 @@ async def show_chapters(message, user_id, page=0):
     await message.edit_text(f"📖 Capítulos ({page+1}/{total_pages})", reply_markup=InlineKeyboardMarkup(buttons))
 
 
+def chapter_number_value(chap):
+    """Extrai um valor numérico para ordenar capítulos de forma natural."""
+    raw = str(chap.get("chapter_number") or chap.get("name") or "")
+    # Aceita 12, 12.5, 001, 12-13 etc.; usa o primeiro número encontrado.
+    m = re.search(r"\d+(?:[.,]\d+)?", raw)
+    if not m:
+        return float("inf")
+    try:
+        return float(m.group(0).replace(",", "."))
+    except Exception:
+        return float("inf")
+
+
+def sort_chapters(chapters, descending=False):
+    # Mantém uma ordenação estável para capítulos sem número.
+    return sorted(chapters, key=chapter_number_value, reverse=descending)
+
+
+async def show_download_options(message, user_id):
+    session = SESSIONS.get((message.chat_id, user_id))
+    if not session or not session.get("chapters"):
+        return
+    await message.edit_text(
+        f"📥 <b>Como deseja baixar?</b>\n\n"
+        f"📖 {session['title']}\n"
+        f"Total: {len(session['chapters'])} capítulos\n\n"
+        "Escolha uma opção:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬆️ Crescente — 1 → último", callback_data=f"order|asc|{user_id}")],
+            [InlineKeyboardButton("⬇️ Decrescente — último → 1", callback_data=f"order|desc|{user_id}")],
+            [InlineKeyboardButton("🔙 Voltar", callback_data=f"back_manga|{user_id}")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_session|{user_id}")],
+        ])
+    )
+
+
+async def choose_order(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not owner_ok(q):
+        return
+    key = (q.message.chat_id, q.from_user.id)
+    session = SESSIONS.get(key)
+    if not session or not session.get("chapters"):
+        await safe_delete(q.message)
+        return
+    descending = q.data.split("|")[1] == "desc"
+    session["chapters"] = sort_chapters(session["chapters"], descending)
+    session["download_order"] = "decrescente" if descending else "crescente"
+    session["updated"] = time.monotonic()
+    await q.message.edit_text(
+        f"📥 <b>Download iniciado</b>\n\n"
+        f"📖 {session['title']}\n"
+        f"🔢 Ordem: {'decrescente' if descending else 'crescente'}\n"
+        f"📚 Capítulos: {len(session['chapters'])}",
+        parse_mode="HTML"
+    )
+    await enqueue(update, context, session["chapters"])
+    await safe_delete(q.message)
+    SESSIONS.pop(key, None)
+
+
+async def back_manga(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not owner_ok(q):
+        return
+    key = (q.message.chat_id, q.from_user.id)
+    session = SESSIONS.get(key)
+    if not session:
+        await safe_delete(q.message)
+        return
+    await q.message.edit_text(
+        f"📖 <b>{session['title']}</b>\nTotal: {len(session['chapters'])} capítulos",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 Baixar tudo", callback_data=f"download_all|0|{q.from_user.id}")],
+            [InlineKeyboardButton("📖 Ver capítulos", callback_data=f"chap_page|0|{q.from_user.id}")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_session|{q.from_user.id}")],
+        ])
+    )
+
+
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancela a sessão atual, uma busca em andamento e o lote de downloads pendente."""
     user_id = update.effective_user.id
@@ -193,10 +255,6 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_msg = SEARCH_MESSAGES.pop(user_id, None)
     if search_msg:
         await safe_delete(search_msg)
-
-    pending_command = COMMAND_MESSAGES.pop(user_id, None)
-    if pending_command:
-        await safe_delete_by_id(context.bot, pending_command[0], pending_command[1], "comando /bb")
 
     # Invalidar imediatamente qualquer lote de downloads desse usuário.
     ACTIVE_BATCHES.pop(user_id, None)
@@ -235,16 +293,10 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     SEARCH_TASKS[user_id] = asyncio.current_task()
-    COMMAND_MESSAGES[user_id] = (command.chat_id, command.message_id)
     search_msg = None
     try:
         async with lock:
             await safe_delete(command)
-            # Segunda tentativa: alguns chats/clients podem atrasar a remoção.
-            async def retry_command_cleanup():
-                await asyncio.sleep(1.2)
-                await safe_delete_by_id(context.bot, command.chat_id, command.message_id, "comando /bb (segunda tentativa)")
-            asyncio.create_task(retry_command_cleanup())
             search_msg = await context.bot.send_message(
                 command.chat_id,
                 "🔎 Buscando...",
@@ -297,9 +349,6 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("Busca cancelada | chat=%s | user=%s", command.chat_id, user_id)
     finally:
         SEARCH_MESSAGES.pop(user_id, None)
-        pending_command = COMMAND_MESSAGES.pop(user_id, None)
-        if pending_command:
-            await safe_delete_by_id(context.bot, pending_command[0], pending_command[1], "comando /bb (limpeza final)")
         if SEARCH_TASKS.get(user_id) is asyncio.current_task():
             SEARCH_TASKS.pop(user_id, None)
 
@@ -316,7 +365,10 @@ async def select_manga(update, context):
         return
     command_id = session.get("command_message_id")
     if command_id:
-        await safe_delete_by_id(context.bot, q.message.chat_id, command_id, "comando /bb")
+        try:
+            await context.bot.delete_message(q.message.chat_id, command_id)
+        except Exception:
+            pass
     index = int(q.data.split("|")[1])
     try:
         item = session["results"][index]
@@ -374,12 +426,7 @@ async def download_all(update, context):
     session = SESSIONS.get((q.message.chat_id, q.from_user.id))
     if not session:
         return
-    command_id = session.get("command_message_id")
-    if command_id:
-        await safe_delete_by_id(context.bot, q.message.chat_id, command_id, "comando /bb")
-    await enqueue(update, context, session["chapters"])
-    await safe_delete(q.message)
-    SESSIONS.pop((q.message.chat_id, q.from_user.id), None)
+    await show_download_options(q.message, q.from_user.id)
 
 
 async def download_one(update, context):
@@ -392,7 +439,10 @@ async def download_one(update, context):
         return
     command_id = session.get("command_message_id")
     if command_id:
-        await safe_delete_by_id(context.bot, q.message.chat_id, command_id, "comando /bb")
+        try:
+            await context.bot.delete_message(q.message.chat_id, command_id)
+        except Exception:
+            pass
     index = int(q.data.split("|")[1])
     chapters = session["chapters"]
     if index >= len(chapters):
@@ -427,7 +477,10 @@ async def cancel_session_callback(update, context):
     if session:
         command_id = session.get("command_message_id")
         if command_id:
-            await safe_delete_by_id(context.bot, chat_id, command_id, "comando /bb")
+            try:
+                await context.bot.delete_message(chat_id, command_id)
+            except Exception:
+                pass
         for message_id in list(session.get("menu_messages", set())):
             try:
                 await context.bot.delete_message(chat_id, message_id)
@@ -473,7 +526,10 @@ async def session_cleaner(application):
             chat_id, _user_id = key
             command_id = session.get("command_message_id")
             if command_id:
-                await safe_delete_by_id(application.bot, chat_id, command_id, "comando /bb")
+                try:
+                    await application.bot.delete_message(chat_id, command_id)
+                except Exception:
+                    pass
             for message_id in list(session.get("menu_messages", set())):
                 try:
                     await application.bot.delete_message(chat_id, message_id)
@@ -536,6 +592,8 @@ def main():
     app.add_handler(CallbackQueryHandler(change_page, pattern=r"^page\|"))
     app.add_handler(CallbackQueryHandler(select_manga, pattern=r"^select\|"))
     app.add_handler(CallbackQueryHandler(download_all, pattern=r"^download_all\|"))
+    app.add_handler(CallbackQueryHandler(choose_order, pattern=r"^order\|"))
+    app.add_handler(CallbackQueryHandler(back_manga, pattern=r"^back_manga\|"))
     app.add_handler(CallbackQueryHandler(download_one, pattern=r"^download_one\|"))
     app.add_handler(CallbackQueryHandler(change_chap_page, pattern=r"^chap_page\|"))
     app.add_handler(CallbackQueryHandler(back_to_results, pattern=r"^back\|"))
