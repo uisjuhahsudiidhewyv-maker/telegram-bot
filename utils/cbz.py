@@ -61,7 +61,7 @@ async def create_cbz(image_urls, manga_title, chapter_name):
     if not image_urls:
         raise Exception("Nenhuma URL de imagem foi fornecida pela fonte")
 
-    cbz_filename = f"{_safe(manga_title)}_{_safe(chapter_name, 'Capitulo')}.cbz"
+    cbz_filename = f"{_safe(chapter_name, 'Capitulo')}.cbz"
 
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
     async with httpx.AsyncClient(timeout=60, follow_redirects=True, limits=limits) as client:
