@@ -457,19 +457,151 @@ async def download_one(update, context):
     session = SESSIONS.get((q.message.chat_id, q.from_user.id))
     if not session:
         return
+    index = int(q.data.split("|")[1])
+    chapters = session["chapters"]
+    if index < 0 or index >= len(chapters):
+        return
+
+    session["selected_index"] = index
+    session["selected_chapter"] = chapters[index]
+    session["updated"] = time.monotonic()
+    chap_label = _chapter_label(chapters[index], index)
+    await q.message.edit_text(
+        f"📥 <b>Como você quer baixar o {chap_label}?</b>\n\n"
+        f"📖 {session['title']}\n\n"
+        "Escolha uma opção:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📗 Apenas {chap_label}", callback_data=f"dl_choice|one|{index}|{q.from_user.id}")],
+            [InlineKeyboardButton("🔢 Baixar até o capítulo...", callback_data=f"dl_choice|until|{index}|{q.from_user.id}")],
+            [InlineKeyboardButton("➡️ Baixar todos a partir deste", callback_data=f"dl_choice|from|{index}|{q.from_user.id}")],
+            [InlineKeyboardButton("⬅️ Voltar", callback_data=f"chap_page|{max(0, index // CHAPTERS_PER_PAGE)}|{q.from_user.id}")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_session|{q.from_user.id}")],
+        ])
+    )
+
+
+def _chapter_label(chap, fallback_index=None):
+    return str(chap.get("name") or chap.get("chapter_number") or (f"Capítulo {fallback_index+1}" if fallback_index is not None else "Capítulo"))
+
+
+async def download_choice(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not owner_ok(q):
+        return
+    parts = q.data.split("|")
+    choice = parts[1]
+    index = int(parts[2])
+    key = (q.message.chat_id, q.from_user.id)
+    session = SESSIONS.get(key)
+    if not session:
+        await safe_delete(q.message)
+        return
+    chapters = session.get("chapters", [])
+    if index < 0 or index >= len(chapters):
+        return
+
+    session["selected_index"] = index
+    session["selected_chapter"] = chapters[index]
+    session["updated"] = time.monotonic()
+
+    if choice == "one":
+        await start_selected_download(update, context, [chapters[index]])
+        return
+
+    if choice == "from":
+        ordered = sort_chapters(chapters, descending=False)
+        selected = chapters[index]
+        selected_key = (chapter_number_value(selected), str(selected.get("name") or ""))
+        selected_pos = next((i for i, c in enumerate(ordered) if (chapter_number_value(c), str(c.get("name") or "")) == selected_key), 0)
+        await start_selected_download(update, context, ordered[selected_pos:])
+        return
+
+    session["range_start_index"] = index
+    await show_until_chapters(q.message, q.from_user.id, 0)
+
+
+async def show_until_chapters(message, user_id, page=0):
+    session = SESSIONS.get((message.chat_id, user_id))
+    if not session:
+        return
+    chapters = sort_chapters(session.get("chapters", []), descending=False)
+    if not chapters:
+        return
+    start_chap = session.get("selected_chapter") or chapters[0]
+    start_value = chapter_number_value(start_chap)
+    candidates = [(i, c) for i, c in enumerate(chapters) if chapter_number_value(c) >= start_value]
+    total_pages = max(1, math.ceil(len(candidates) / CHAPTERS_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    begin = page * CHAPTERS_PER_PAGE
+    buttons = []
+    for i, chap in candidates[begin:begin + CHAPTERS_PER_PAGE]:
+        buttons.append([InlineKeyboardButton(
+            f"Até {_chapter_label(chap, i)}",
+            callback_data=f"until_select|{i}|{user_id}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("«", callback_data=f"until_page|{page-1}|{user_id}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("»", callback_data=f"until_page|{page+1}|{user_id}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("⬅️ Voltar", callback_data=f"download_one|{session.get('selected_index', 0)}|{user_id}")])
+    buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_session|{user_id}")])
+    await message.edit_text(
+        f"🔢 <b>Baixar até qual capítulo?</b>\n\n"
+        f"Início: {_chapter_label(start_chap)}\n\n"
+        "Escolha o capítulo final:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def until_page(update, context):
+    q = update.callback_query
+    await q.answer()
+    if owner_ok(q):
+        await show_until_chapters(q.message, q.from_user.id, int(q.data.split("|")[1]))
+
+
+async def until_select(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not owner_ok(q):
+        return
+    key = (q.message.chat_id, q.from_user.id)
+    session = SESSIONS.get(key)
+    if not session:
+        await safe_delete(q.message)
+        return
+    end_idx = int(q.data.split("|")[1])
+    chapters = sort_chapters(session.get("chapters", []), descending=False)
+    if end_idx < 0 or end_idx >= len(chapters):
+        return
+    start_chap = session.get("selected_chapter")
+    start_value = chapter_number_value(start_chap) if start_chap else chapter_number_value(chapters[0])
+    end_value = chapter_number_value(chapters[end_idx])
+    chosen = [c for c in chapters if start_value <= chapter_number_value(c) <= end_value]
+    await start_selected_download(update, context, chosen)
+
+
+async def start_selected_download(update, context, chapters):
+    q = update.callback_query
+    key = (q.message.chat_id, q.from_user.id)
+    session = SESSIONS.get(key)
+    if not session or not chapters:
+        return
     command_id = session.get("command_message_id")
     if command_id:
         try:
             await context.bot.delete_message(q.message.chat_id, command_id)
         except Exception:
             pass
-    index = int(q.data.split("|")[1])
-    chapters = session["chapters"]
-    if index >= len(chapters):
-        return
-    await enqueue(update, context, [chapters[index]])
+    await enqueue(update, context, chapters)
     await safe_delete(q.message)
-    SESSIONS.pop((q.message.chat_id, q.from_user.id), None)
+    SESSIONS.pop(key, None)
 
 
 async def cancel_session_callback(update, context):
@@ -670,6 +802,9 @@ def main():
     app.add_handler(CallbackQueryHandler(choose_order, pattern=r"^order\|"))
     app.add_handler(CallbackQueryHandler(back_manga, pattern=r"^back_manga\|"))
     app.add_handler(CallbackQueryHandler(download_one, pattern=r"^download_one\|"))
+    app.add_handler(CallbackQueryHandler(download_choice, pattern=r"^dl_choice\|"))
+    app.add_handler(CallbackQueryHandler(until_page, pattern=r"^until_page\|"))
+    app.add_handler(CallbackQueryHandler(until_select, pattern=r"^until_select\|"))
     app.add_handler(CallbackQueryHandler(change_chap_page, pattern=r"^chap_page\|"))
     app.add_handler(CallbackQueryHandler(back_to_results, pattern=r"^back\|"))
     log.info("🤖 Bot iniciado")
