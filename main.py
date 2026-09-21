@@ -5,9 +5,11 @@ import os
 import re
 import time
 import unicodedata
+from collections import defaultdict
+from io import BytesIO
 
 import httpx
-from collections import defaultdict
+from bs4 import BeautifulSoup
 from uuid import uuid4
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,8 +18,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from auth import authorized
 from utils.loader import get_all_sources
 from utils.cbz import create_cbz
-from utils.database import Database
-from utils.cover import resolve_cover_url
+from db import Database
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("mangabot")
@@ -34,13 +35,6 @@ TEMP_ERROR_SECONDS = 5
 SESSION_TTL = 600
 ACTIVE_BATCHES = {}
 BATCH_PROGRESS = {}
-
-# /update: pesquisa multitarefa, mas downloads/envios de obras em sequência.
-UPDATE_QUEUE = asyncio.Queue()
-UPDATE_SESSIONS = {}
-UPDATE_ACTIVE = {}
-UPDATE_SEARCH_LIMIT = asyncio.Semaphore(8)
-MAX_UPDATE_ITEMS = 160
 DB = Database()
 
 
@@ -79,7 +73,7 @@ async def safe_delete(message):
 
 async def temp_error(bot, chat_id, text, thread_id=None):
     try:
-        msg = await bot.send_message(chat_id, text)
+        msg = await bot.send_message(chat_id, text, message_thread_id=thread_id)
         await asyncio.sleep(TEMP_ERROR_SECONDS)
         await safe_delete(msg)
     except Exception:
@@ -96,7 +90,10 @@ async def search_one(name, source, query):
             url = item.get("url")
             # Busca Global filtra somente pelo título.
             if title and url and title_matches(title, query):
-                valid.append({"source": name, "title": title, "url": url})
+                result = {"source": name, "title": title, "url": url}
+                if item.get("cover_url"):
+                    result["cover_url"] = item["cover_url"]
+                valid.append(result)
         log.info("Busca | %-22s | OK | %d resultados", name, len(valid))
         return valid
     except Exception as e:
@@ -114,6 +111,90 @@ def dedupe(items):
         seen.add(key)
         out.append(item)
     return out
+
+
+async def resolve_cover_url(source, manga_url, hinted_url=None):
+    """Obtém uma URL de capa sem gravá-la no disco."""
+    if hinted_url:
+        return hinted_url
+    cover_method = getattr(source, "cover_url", None)
+    if cover_method:
+        try:
+            return await cover_method(manga_url)
+        except Exception as e:
+            log.debug("Capa específica falhou: %s", e)
+
+    if not isinstance(manga_url, str) or not manga_url.startswith(("http://", "https://")):
+        return None
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=20, follow_redirects=True
+        ) as client:
+            r = await client.get(manga_url)
+            r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for selector in (
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'meta[property="og:image:url"]',
+        ):
+            tag = soup.select_one(selector)
+            if tag and tag.get("content"):
+                return tag["content"]
+        return None
+    except Exception as e:
+        log.debug("Não foi possível descobrir capa em %s: %s", manga_url, e)
+        return None
+
+
+async def send_and_cache_cover(bot, chat_id, session):
+    """Envia a capa antes dos capítulos e guarda o file_id no PostgreSQL/SQLite."""
+    source_name = session.get("source_name")
+    manga_url = session.get("manga_url")
+    title = session.get("title")
+    if not source_name or not manga_url:
+        return None
+
+    cached = await DB.get_cover_file_id(source_name, manga_url)
+    try:
+        if cached:
+            msg = await bot.send_photo(chat_id=chat_id, photo=cached, caption=f"📖 <b>{title}</b>", parse_mode="HTML", message_thread_id=session.get("thread_id"))
+            return msg.photo[-1].file_id if msg.photo else cached
+    except Exception as e:
+        log.info("file_id da capa expirou/está inválido; buscando novamente: %s", e)
+
+    cover_url = await resolve_cover_url(session["source"], manga_url, session.get("cover_url"))
+    if not cover_url:
+        log.info("Sem capa disponível | %s | %s", source_name, title)
+        return None
+
+    msg = None
+    try:
+        # Telegram busca a imagem diretamente da URL; não ocupa disco no Railway.
+        msg = await bot.send_photo(
+            chat_id=chat_id,
+            photo=cover_url,
+            caption=f"📖 <b>{title}</b>",
+            parse_mode="HTML",
+            message_thread_id=session.get("thread_id"),
+        )
+    except Exception:
+        # Fallback: baixa somente para memória e envia, sem criar arquivo temporário.
+        async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}, timeout=30, follow_redirects=True) as client:
+            r = await client.get(cover_url)
+            r.raise_for_status()
+            msg = await bot.send_photo(
+                chat_id=chat_id,
+                photo=BytesIO(r.content),
+                caption=f"📖 <b>{title}</b>",
+                parse_mode="HTML",
+                message_thread_id=session.get("thread_id"),
+            )
+
+    file_id = msg.photo[-1].file_id if msg.photo else None
+    if file_id:
+        await DB.set_cover_file_id(source_name, manga_url, file_id)
+    return file_id
 
 
 async def show_results(message, user_id, page):
@@ -223,6 +304,11 @@ async def choose_order(update, context):
         f"📚 Capítulos: {len(session['chapters'])}",
         parse_mode="HTML"
     )
+    # A capa é enviada primeiro. Depois os capítulos entram na fila.
+    try:
+        await send_and_cache_cover(context.bot, q.message.chat_id, session)
+    except Exception as e:
+        log.warning("Capa | %s | ERRO | %s", session.get("title"), e)
     await enqueue(update, context, session["chapters"])
     await safe_delete(q.message)
     SESSIONS.pop(key, None)
@@ -256,10 +342,6 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     key = (chat_id, user_id)
 
-    # Invalida uma fila /update em execução. O worker termina o item atual e não inicia o próximo.
-    UPDATE_ACTIVE.pop(key, None)
-    UPDATE_SESSIONS.pop(key, None)
-
     if not authorized(user_id):
         await safe_delete(command)
         return
@@ -292,311 +374,6 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # criar outro rastro no tópico.
     await safe_delete(command)
     log.info("Sessão/lote cancelado | chat=%s | user=%s", chat_id, user_id)
-
-
-
-def parse_update_items(text):
-    """Aceita /update Naruto, Blue Lock, One Piece ou uma obra por linha."""
-    raw = re.sub(r"^/update(?:@\w+)?\s*", "", (text or "").strip(), flags=re.I)
-    parts = re.split(r"[,;\n]+", raw)
-    out, seen = [], set()
-    for part in parts:
-        item = re.sub(r"\s+", " ", part).strip()
-        key = norm(item)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out[:MAX_UPDATE_ITEMS]
-
-
-def update_chapter_key(source_name, chapter):
-    # A URL/id estável é preferível ao nome, pois evita repetir capítulos.
-    value = chapter.get("url") or chapter.get("name") or chapter.get("chapter_number")
-    return f"{source_name}|{value}"
-
-
-async def update_search_all_sources(query):
-    sources = get_all_sources()
-    results = await asyncio.gather(
-        *(search_one(name, source, query) for name, source in sources.items()),
-        return_exceptions=True,
-    )
-    combined = []
-    for result in results:
-        if isinstance(result, Exception):
-            continue
-        combined.extend(result or [])
-    return dedupe(combined)
-
-
-async def update_prepare_work(query, chat_id):
-    """Resolve uma obra e calcula somente capítulos ainda não enviados ao chat."""
-    async with UPDATE_SEARCH_LIMIT:
-        candidates = await update_search_all_sources(query)
-        if not candidates:
-            return {"query": query, "found": False}
-
-        # Tenta as fontes em paralelo. O primeiro resultado com capítulos válidos
-        # vira a fonte operacional da obra; as demais continuam sendo fallback futuro.
-        async def load_candidate(item):
-            source = get_all_sources().get(item["source"])
-            if not source:
-                return None
-            try:
-                async with asyncio.timeout(45):
-                    chapters = await source.chapters(item["url"])
-                if chapters:
-                    return {"item": item, "source": source, "chapters": chapters}
-            except Exception as exc:
-                log.debug("/update capítulos | %s | %s | %s", item["source"], query, exc)
-            return None
-
-        # Uma fonte por nome para não consultar o mesmo endpoint várias vezes.
-        selected = []
-        seen_sources = set()
-        for item in candidates:
-            if item["source"] not in seen_sources:
-                seen_sources.add(item["source"])
-                selected.append(item)
-        loaded = await asyncio.gather(*(load_candidate(x) for x in selected[:7]), return_exceptions=True)
-        valid = [x for x in loaded if isinstance(x, dict) and x.get("chapters")]
-        if not valid:
-            return {"query": query, "found": False}
-
-        # Preferimos a primeira fonte funcional para manter a ordem previsível.
-        chosen = valid[0]
-        item = chosen["item"]
-        source = chosen["source"]
-        chapters = sort_chapters(chosen["chapters"], descending=False)
-        work = await DB.get_or_create_work(item["source"], item["url"], item["title"])
-        sent = await DB.sent_keys(chat_id, work["id"])
-        new_chapters = [c for c in chapters if update_chapter_key(item["source"], c) not in sent]
-        cover_url = await resolve_cover_url(source, item)
-        return {
-            "query": query,
-            "found": True,
-            "title": item["title"],
-            "source_name": item["source"],
-            "source": source,
-            "url": item["url"],
-            "work_id": work["id"],
-            "cover_file_id": work.get("cover_file_id"),
-            "cover_url": cover_url,
-            "chapters": chapters,
-            "new_chapters": new_chapters,
-        }
-
-
-async def update_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    command = update.effective_message
-    chat_id = update.effective_chat.id
-    if not authorized(user_id):
-        await temp_error(context.bot, chat_id, "⛔ Usuário não autorizado.", command.message_thread_id)
-        await safe_delete(command)
-        return
-
-    queries = parse_update_items(command.text or "")
-    if not queries:
-        await temp_error(context.bot, chat_id, "Use /update Naruto, Blue Lock, One Piece", command.message_thread_id)
-        await safe_delete(command)
-        return
-    if (chat_id, user_id) in UPDATE_ACTIVE:
-        await temp_error(context.bot, chat_id, "⏳ Já existe uma atualização em andamento para este grupo.", command.message_thread_id)
-        await safe_delete(command)
-        return
-
-    await safe_delete(command)
-    status = await context.bot.send_message(chat_id, f"🔎 Pesquisando {len(queries)} obras...", message_thread_id=command.message_thread_id)
-    try:
-        prepared = await asyncio.gather(*(update_prepare_work(q, chat_id) for q in queries))
-        found = [x for x in prepared if x.get("found")]
-        total_chapters = sum(len(x["chapters"]) for x in found)
-        new_total = sum(len(x["new_chapters"]) for x in found)
-        UPDATE_SESSIONS[(chat_id, user_id)] = {
-            "works": prepared,
-            "thread_id": command.message_thread_id,
-            "status_message_id": status.message_id,
-            "created": time.monotonic(),
-        }
-        lines = [
-            "📊 <b>Resultado da atualização</b>",
-            "",
-            f"📚 Obras encontradas: <b>{len(found)}</b> de <b>{len(queries)}</b>",
-            f"🔢 Capítulos encontrados: <b>{total_chapters}</b>",
-            f"🆕 Capítulos novos: <b>{new_total}</b>",
-        ]
-        missing = [x["query"] for x in prepared if not x.get("found")]
-        if missing:
-            lines += ["", "❌ Não encontradas:", "• " + "\n• ".join(missing[:20])]
-        if new_total:
-            buttons = [[InlineKeyboardButton(f"📥 Baixar {new_total} capítulos", callback_data=f"update_start|{user_id}")]]
-        else:
-            buttons = [[InlineKeyboardButton("🔄 Reconsultar", callback_data=f"update_close|{user_id}")]]
-        buttons.append([InlineKeyboardButton("❌ Fechar", callback_data=f"update_close|{user_id}")])
-        await status.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as exc:
-        log.exception("/update falhou: %s", exc)
-        await safe_delete(status)
-        await temp_error(context.bot, chat_id, "❌ Falha ao preparar a atualização.", command.message_thread_id)
-        UPDATE_SESSIONS.pop((chat_id, user_id), None)
-
-
-async def send_cover_for_work(application, work, chat_id, thread_id):
-    """Envia/cacheia a capa; nenhuma imagem é mantida no disco do servidor."""
-    try:
-        if work.get("cover_file_id"):
-            msg = await application.bot.send_photo(chat_id, work["cover_file_id"], message_thread_id=thread_id)
-            return msg
-        url = work.get("cover_url")
-        if not url:
-            return None
-        try:
-            msg = await application.bot.send_photo(chat_id, url, message_thread_id=thread_id)
-        except Exception:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                r.raise_for_status()
-                from io import BytesIO
-                bio = BytesIO(r.content)
-                msg = await application.bot.send_photo(chat_id, bio, filename="cover.jpg", message_thread_id=thread_id)
-                bio.close()
-        if msg and msg.photo:
-            file_id = msg.photo[-1].file_id
-            await DB.set_cover_file_id(work["work_id"], file_id)
-            work["cover_file_id"] = file_id
-        return msg
-    except Exception as exc:
-        log.warning("Capa | %s | %s", work.get("title"), exc)
-        return None
-
-
-async def run_update_batch(application, batch):
-    chat_id = batch["chat_id"]
-    user_id = batch["user_id"]
-    thread_id = batch["thread_id"]
-    works = batch["works"]
-    total_new = sum(len(w["new_chapters"]) for w in works)
-    progress = await application.bot.send_message(
-        chat_id,
-        f"🚀 <b>Atualização iniciada</b>\n\n📚 {len(works)} obras\n🆕 {total_new} capítulos novos\n\n⏳ Preparando...",
-        parse_mode="HTML", message_thread_id=thread_id,
-    )
-    sent_total = 0
-    failed_total = 0
-    for pos, work in enumerate(works, 1):
-        if UPDATE_ACTIVE.get((chat_id, user_id)) != batch["batch_id"]:
-            break
-        if not work.get("found"):
-            continue
-        new_chapters = work.get("new_chapters") or []
-        try:
-            await progress.edit_text(
-                f"🟢 <b>{pos}/{len(works)} — {work['title']}</b>\n\n🖼️ Enviando capa...\n📖 {len(new_chapters)} capítulos novos",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        await send_cover_for_work(application, work, chat_id, thread_id)
-        for index, chap in enumerate(new_chapters, 1):
-            if UPDATE_ACTIVE.get((chat_id, user_id)) != batch["batch_id"]:
-                break
-            chapter_label = chap.get("name") or f"Capítulo {chap.get('chapter_number')}"
-            try:
-                await progress.edit_text(
-                    f"🟢 <b>{pos}/{len(works)} — {work['title']}</b>\n\n"
-                    f"📖 {index}/{len(new_chapters)}\n📄 {chapter_label}\n⏳ Baixando...",
-                    parse_mode="HTML",
-                )
-                pages = await asyncio.wait_for(work["source"].pages(chap["url"]), timeout=120)
-                if not pages:
-                    raise RuntimeError("Nenhuma página encontrada")
-                cbz_buffer, cbz_name = await create_cbz(pages, work["title"], f"Capítulo {chap.get('chapter_number')}")
-                try:
-                    cbz_buffer.seek(0)
-                    sent_msg = await application.bot.send_document(
-                        chat_id=chat_id, document=cbz_buffer, filename=cbz_name, message_thread_id=thread_id
-                    )
-                    file_id = getattr(getattr(sent_msg, "document", None), "file_id", None)
-                finally:
-                    # O CBZ existe somente em RAM e é liberado imediatamente após o envio.
-                    cbz_buffer.close()
-                await DB.mark_sent(chat_id, work["work_id"], update_chapter_key(work["source_name"], chap), chap.get("chapter_number"), chapter_label, file_id)
-                sent_total += 1
-            except Exception as exc:
-                failed_total += 1
-                log.exception("/update capítulo | %s | %s | %s", work.get("title"), chapter_label, exc)
-                try:
-                    await progress.edit_text(
-                        f"⚠️ <b>{work['title']}</b>\n📄 {chapter_label}\n❌ Falhou; continuando para o próximo.",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-        try:
-            await progress.edit_text(
-                f"✅ <b>{pos}/{len(works)} — {work['title']}</b>\n\n"
-                f"📤 {len(new_chapters)} capítulos processados\n➡️ Próxima obra...",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    UPDATE_ACTIVE.pop((chat_id, user_id), None)
-    UPDATE_SESSIONS.pop((chat_id, user_id), None)
-    try:
-        await progress.edit_text(
-            f"🏁 <b>Atualização concluída</b>\n\n📚 Obras: {len(works)}\n📤 Enviados: {sent_total}\n❌ Falhas: {failed_total}",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-
-
-async def update_worker(application):
-    while True:
-        batch = await UPDATE_QUEUE.get()
-        try:
-            await run_update_batch(application, batch)
-        except Exception:
-            log.exception("Erro no worker /update")
-            UPDATE_ACTIVE.pop((batch["chat_id"], batch["user_id"]), None)
-        finally:
-            UPDATE_QUEUE.task_done()
-
-
-async def update_start_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-    if not owner_ok(q):
-        return
-    key = (q.message.chat_id, q.from_user.id)
-    session = UPDATE_SESSIONS.get(key)
-    if not session:
-        await safe_delete(q.message)
-        return
-    if key in UPDATE_ACTIVE:
-        return
-    batch_id = uuid4().hex
-    UPDATE_ACTIVE[key] = batch_id
-    batch = {
-        "batch_id": batch_id,
-        "chat_id": q.message.chat_id,
-        "user_id": q.from_user.id,
-        "thread_id": session["thread_id"],
-        "works": session["works"],
-    }
-    await UPDATE_QUEUE.put(batch)
-    await safe_delete(q.message)
-
-
-async def update_close_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-    if not owner_ok(q):
-        return
-    UPDATE_SESSIONS.pop((q.message.chat_id, q.from_user.id), None)
-    await safe_delete(q.message)
 
 
 async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -705,7 +482,19 @@ async def select_manga(update, context):
             await safe_delete(q.message)
             await temp_error(context.bot, q.message.chat_id, "❌ Nenhum capítulo encontrado.", session["thread_id"])
             return
-        session.update({"source": source, "source_name": item["source"], "title": item["title"], "chapters": chapters, "updated": time.monotonic()})
+        work_id = await DB.upsert_work(item["title"], item["source"], item["url"])
+        for chap in chapters:
+            await DB.upsert_chapter(work_id, chap)
+        session.update({
+            "source": source,
+            "source_name": item["source"],
+            "title": item["title"],
+            "manga_url": item["url"],
+            "cover_url": item.get("cover_url"),
+            "work_id": work_id,
+            "chapters": chapters,
+            "updated": time.monotonic(),
+        })
         await safe_delete(q.message)
         menu = await context.bot.send_message(
             q.message.chat_id,
@@ -755,6 +544,7 @@ async def enqueue(update, context, chapters):
             "source_name": session["source_name"],
             "chapter": chap,
             "title": session["title"],
+            "work_id": session.get("work_id"),
             "batch_id": batch_id,
         })
 
@@ -788,6 +578,10 @@ async def download_one(update, context):
     chapters = session["chapters"]
     if index >= len(chapters):
         return
+    try:
+        await send_and_cache_cover(context.bot, q.message.chat_id, session)
+    except Exception as e:
+        log.warning("Capa | %s | ERRO | %s", session.get("title"), e)
     await enqueue(update, context, [chapters[index]])
     await safe_delete(q.message)
     SESSIONS.pop((q.message.chat_id, q.from_user.id), None)
@@ -801,9 +595,6 @@ async def cancel_session_callback(update, context):
     user_id = q.from_user.id
     chat_id = q.message.chat_id
     key = (chat_id, user_id)
-
-    UPDATE_ACTIVE.pop(key, None)
-    UPDATE_SESSIONS.pop(key, None)
 
     search_task = SEARCH_TASKS.get(user_id)
     if search_task and search_task is not asyncio.current_task():
@@ -963,11 +754,13 @@ async def download_worker(application):
                 try:
                     cbz_buffer, cbz_name = await create_cbz(pages, job["title"], f"Capítulo {chap.get('chapter_number')}")
                     cbz_buffer.seek(0)
-                    await application.bot.send_document(
+                    sent_msg = await application.bot.send_document(
                         chat_id=job["chat_id"], document=cbz_buffer, filename=cbz_name,
                         message_thread_id=job["thread_id"]
                     )
                     cbz_buffer.close()
+                    if job.get("work_id") and sent_msg.document:
+                        await DB.mark_chapter_sent(job["work_id"], chap.get("url"), sent_msg.document.file_id)
                     log.info("Download | %s | %s | OK | %d páginas", job["source_name"], chap.get("name"), len(pages))
                     await update_progress(application, job, True, chap.get("name"))
                 except Exception as e:
@@ -979,20 +772,17 @@ async def download_worker(application):
 
 
 async def post_init(application):
-    await DB.init()
+    await DB.connect()
+    log.info("Banco conectado | %s", DB.kind)
     application.create_task(download_worker(application))
-    application.create_task(update_worker(application))
     application.create_task(session_cleaner(application))
 
 
 def main():
     app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).post_init(post_init).build()
     app.add_handler(CommandHandler("bb", buscar))
-    app.add_handler(CommandHandler("update", update_search_command))
     app.add_handler(CommandHandler("cancelar", cancelar))
     app.add_handler(CallbackQueryHandler(cancel_session_callback, pattern=r"^cancel_session\|"))
-    app.add_handler(CallbackQueryHandler(update_start_callback, pattern=r"^update_start\|"))
-    app.add_handler(CallbackQueryHandler(update_close_callback, pattern=r"^update_close\|"))
     app.add_handler(CallbackQueryHandler(change_page, pattern=r"^page\|"))
     app.add_handler(CallbackQueryHandler(select_manga, pattern=r"^select\|"))
     app.add_handler(CallbackQueryHandler(download_all, pattern=r"^download_all\|"))
@@ -1007,4 +797,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
