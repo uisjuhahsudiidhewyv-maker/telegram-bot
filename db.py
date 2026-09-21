@@ -138,6 +138,15 @@ class Database:
             ).fetchone()
             return row[0] if row else None
 
+    async def get_cover_file_id(self, source: str, source_url: str) -> Optional[str]:
+        await self.connect()
+        async with self.lock:
+            row = self.conn.execute(
+                "SELECT cover_file_id FROM works WHERE source=? AND source_url=? LIMIT 1",
+                (source, source_url),
+            ).fetchone()
+            return row[0] if row and row[0] else None
+
     async def set_cover_file_id(self, title: str, source: str, source_url: str, file_id: str):
         work_id = await self.ensure_work(title, source, source_url)
         async with self.lock:
