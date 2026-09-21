@@ -7,7 +7,10 @@ import time
 import unicodedata
 from collections import defaultdict
 from uuid import uuid4
+from io import BytesIO
 
+import httpx
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -20,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("mangabot")
 
 DOWNLOAD_QUEUE = asyncio.Queue()
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
 SESSIONS = {}
 SEARCH_LOCKS = defaultdict(asyncio.Lock)
 SEARCH_TASKS = {}
@@ -31,6 +34,7 @@ TEMP_ERROR_SECONDS = 5
 SESSION_TTL = 600
 ACTIVE_BATCHES = {}
 BATCH_PROGRESS = {}
+UPDATE_PENDING = {}
 
 
 def norm(text):
@@ -103,6 +107,89 @@ def dedupe(items):
         seen.add(key)
         out.append(item)
     return out
+
+
+async def resolve_cover_url(source, item):
+    """Resolve uma URL de capa sem obrigar cada source a implementar cover()."""
+    direct = item.get("cover_url") or item.get("image") or item.get("picture_url")
+    if direct:
+        return direct
+    if hasattr(source, "cover_url"):
+        try:
+            value = source.cover_url(item["url"])
+            if asyncio.iscoroutine(value):
+                value = await value
+            if value:
+                return value
+        except Exception:
+            pass
+    # MangaDex: a API informa o nome do arquivo da capa.
+    if "mangadex" in source.__class__.__name__.lower():
+        try:
+            api = getattr(source, "api", "https://api.mangadex.org")
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                r = await client.get(f"{api}/manga/{item['url']}", params=[("includes[]", "cover_art")])
+                r.raise_for_status()
+                data = r.json()
+            rel = next((x for x in data.get("data", {}).get("relationships", []) if x.get("type") == "cover_art"), None)
+            filename = (rel or {}).get("attributes", {}).get("fileName")
+            if filename:
+                return f"https://uploads.mangadex.org/covers/{item['url']}/{filename}.512.jpg"
+        except Exception as e:
+            log.debug("Capa MangaDex: %s", e)
+    # Para sources que devolvem uma página como URL, tenta og:image/twitter:image/primeiro img.
+    url = item.get("url")
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        try:
+            async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0"}) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            for attrs in (
+                {"property": "og:image"}, {"name": "twitter:image"}, {"property": "twitter:image"}
+            ):
+                tag = soup.find("meta", attrs=attrs)
+                if tag and tag.get("content"):
+                    return str(tag["content"])
+            img = soup.find("img")
+            if img:
+                src = img.get("data-src") or img.get("src")
+                if src:
+                    from urllib.parse import urljoin
+                    return urljoin(str(r.url), src)
+        except Exception as e:
+            log.debug("Capa genérica: %s", e)
+    return None
+
+
+async def send_cover(bot, chat_id, thread_id, title, source_name, source, item, caption_extra=""):
+    """Envia a capa; reutiliza o file_id salvo no SQLite quando existir."""
+    source_url = item.get("url", "")
+    cached = await DB.get_cover_file_id(source_name, source_url)
+    caption = f"📖 <b>{title}</b>"
+    if caption_extra:
+        caption += f"\n{caption_extra}"
+    try:
+        if cached:
+            msg = await bot.send_photo(chat_id=chat_id, photo=cached, caption=caption, parse_mode="HTML", message_thread_id=thread_id)
+            return getattr(getattr(msg, "photo", [None])[-1], "file_id", None) or cached
+        cover_url = await resolve_cover_url(source, item)
+        if not cover_url:
+            return None
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0"}) as client:
+            r = await client.get(cover_url)
+            r.raise_for_status()
+            content = r.content
+        if not content:
+            return None
+        msg = await bot.send_photo(chat_id=chat_id, photo=BytesIO(content), caption=caption, parse_mode="HTML", message_thread_id=thread_id)
+        file_id = getattr(getattr(msg, "photo", [None])[-1], "file_id", None)
+        if file_id:
+            await DB.set_cover_file_id(title, source_name, source_url, file_id)
+        return file_id
+    except Exception as e:
+        log.warning("Capa | %s | %s | ERRO | %s", source_name, title, e)
+        return None
 
 
 async def show_results(message, user_id, page):
@@ -387,6 +474,10 @@ async def select_manga(update, context):
             return
         session.update({"source": source, "source_name": item["source"], "title": item["title"], "source_url": item["url"], "work_url": item["url"], "chapters": chapters, "updated": time.monotonic()})
         await safe_delete(q.message)
+        await send_cover(
+            context.bot, q.message.chat_id, session["thread_id"],
+            item["title"], item["source"], source, item
+        )
         menu = await context.bot.send_message(
             q.message.chat_id,
             f"📖 {item['title']}\nTotal: {len(chapters)} capítulos",
@@ -401,6 +492,106 @@ async def select_manga(update, context):
         log.warning("Capítulos | %s | ERRO | %s", item.get("source", "?"), e)
         await safe_delete(q.message)
         await temp_error(context.bot, q.message.chat_id, "❌ Erro ao obter capítulos.", session["thread_id"])
+
+
+async def update_search_one(query):
+    sources = get_all_sources()
+    batches = await asyncio.gather(*(search_one(name, source, query) for name, source in sources.items()))
+    results = dedupe([x for batch in batches for x in batch])
+    if not results:
+        return None
+    # Prefere título exatamente igual; caso não exista, usa o primeiro resultado.
+    qn = norm(query)
+    exact = next((x for x in results if norm(x["title"]) == qn), None)
+    return exact or results[0]
+
+
+async def atualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    command = update.effective_message
+    if not authorized(user_id):
+        await temp_error(context.bot, command.chat_id, "⛔ Usuário não autorizado.", command.message_thread_id)
+        await safe_delete(command)
+        return
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await temp_error(context.bot, command.chat_id, "Use /update Naruto, Blue Lock, One Piece", command.message_thread_id)
+        await safe_delete(command)
+        return
+    names = [x.strip() for x in raw.split(",") if x.strip()]
+    status = await context.bot.send_message(command.chat_id, f"🔎 Verificando {len(names)} obra(s)...", message_thread_id=command.message_thread_id)
+    try:
+        found = await asyncio.gather(*(update_search_one(name) for name in names))
+        pending = []
+        lines = []
+        for requested, item in zip(names, found):
+            if not item:
+                lines.append(f"❌ <b>{requested}</b> — não encontrada")
+                continue
+            source = get_all_sources()[item["source"]]
+            try:
+                chapters = await source.chapters(item["url"])
+            except Exception as e:
+                log.warning("Update capítulos | %s | %s", requested, e)
+                lines.append(f"⚠️ <b>{item['title']}</b> — erro ao consultar capítulos")
+                continue
+            new = [c for c in chapters if not await DB.is_chapter_sent(item["source"], c.get("url", ""))]
+            if new:
+                new = sort_chapters(new, descending=False)
+                nums = ", ".join(str(c.get("chapter_number") or c.get("name") or "?") for c in new)
+                lines.append(f"🆕 <b>{item['title']}</b> — {len(new)} novo(s): {nums[:700]}")
+                pending.append({"title": item["title"], "source_name": item["source"], "source_url": item["url"], "chapters": new})
+            else:
+                lines.append(f"✅ <b>{item['title']}</b> — nenhum capítulo novo")
+        if pending:
+            key=(command.chat_id,user_id)
+            UPDATE_PENDING[key] = {"works": pending, "thread_id": command.message_thread_id, "updated": time.monotonic()}
+            await status.edit_text(
+                "📋 <b>Resultado da atualização</b>\n\n" + "\n".join(lines) +
+                "\n\nDeseja baixar os capítulos novos?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Atualizar", callback_data=f"update_confirm|{user_id}"),
+                     InlineKeyboardButton("❌ Cancelar", callback_data=f"update_cancel|{user_id}")]
+                ])
+            )
+        else:
+            await status.edit_text("📋 <b>Atualização</b>\n\n"+"\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        log.exception("/update: %s", e)
+        await status.edit_text("❌ Erro ao verificar as obras.")
+    finally:
+        await safe_delete(command)
+
+
+async def update_confirm(update, context):
+    q=update.callback_query
+    await q.answer()
+    if not owner_ok(q): return
+    key=(q.message.chat_id,q.from_user.id)
+    data=UPDATE_PENDING.pop(key,None)
+    if not data:
+        await safe_delete(q.message); return
+    batch_id=uuid4().hex
+    ACTIVE_BATCHES[q.from_user.id]=batch_id
+    total=sum(len(w["chapters"]) for w in data["works"])
+    progress_msg=await q.message.edit_text(f"📥 <b>Atualização iniciada</b>\n\n📚 {len(data['works'])} obra(s)\n📊 0/{total} capítulos",parse_mode="HTML")
+    BATCH_PROGRESS[batch_id]={"message":progress_msg,"total":total,"done":0,"ok":0,"failed":0,"title":"Atualização","lock":asyncio.Lock()}
+    for work in data["works"]:
+        source=get_all_sources()[work["source_name"]]
+        item={"title":work["title"],"url":work["source_url"]}
+        for chap in work["chapters"]:
+            await DOWNLOAD_QUEUE.put({"chat_id":q.message.chat_id,"thread_id":data["thread_id"],"user_id":q.from_user.id,
+                "source":source,"source_name":work["source_name"],"chapter":chap,"title":work["title"],"work_url":work["source_url"],"batch_id":batch_id,
+                "cover_item":item})
+
+
+async def update_cancel(update, context):
+    q=update.callback_query
+    await q.answer()
+    if owner_ok(q):
+        UPDATE_PENDING.pop((q.message.chat_id,q.from_user.id),None)
+        await safe_delete(q.message)
 
 
 async def enqueue(update, context, chapters):
@@ -637,6 +828,13 @@ async def download_worker(application):
                 if ACTIVE_BATCHES.get(job["user_id"]) != job.get("batch_id"):
                     log.info("Download cancelado/ignorado | %s | %s", job["source_name"], chap.get("name"))
                     continue
+                progress = BATCH_PROGRESS.get(job.get("batch_id"))
+                if progress is not None:
+                    covers = progress.setdefault("covers_sent", set())
+                    cover_key = (job.get("source_name"), job.get("work_url"))
+                    if cover_key not in covers:
+                        await send_cover(application.bot, job["chat_id"], job["thread_id"], job["title"], job["source_name"], source, job.get("cover_item") or {"title":job["title"],"url":job.get("work_url")})
+                        covers.add(cover_key)
                 try:
                     async with asyncio.timeout(90):
                         pages = await source.pages(chap["url"])
@@ -694,8 +892,11 @@ async def post_shutdown(application):
 def main():
     app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("bb", buscar))
+    app.add_handler(CommandHandler("update", atualizar))
     app.add_handler(CommandHandler("cancelar", cancelar))
     app.add_handler(CallbackQueryHandler(cancel_session_callback, pattern=r"^cancel_session\|"))
+    app.add_handler(CallbackQueryHandler(update_confirm, pattern=r"^update_confirm\|"))
+    app.add_handler(CallbackQueryHandler(update_cancel, pattern=r"^update_cancel\|"))
     app.add_handler(CallbackQueryHandler(change_page, pattern=r"^page\|"))
     app.add_handler(CallbackQueryHandler(select_manga, pattern=r"^select\|"))
     app.add_handler(CallbackQueryHandler(download_all, pattern=r"^download_all\|"))
